@@ -23,10 +23,15 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 # Channels for Claude Code apt repo: "stable" or "latest"
 ARG CLAUDE_CODE_CHANNEL=latest
-# Neovim release to install from the upstream tarball. "stable" tracks the
-# latest tagged release; can be pinned (e.g. "v0.11.3") for reproducibility.
+# Neovim release to install from the upstream tarball. Pinned to a 0.11.x
+# patch release because nvim-treesitter's `master` branch (which our plugin
+# spec uses) explicitly does NOT support Neovim 0.12 — the "stable" channel
+# silently jumped to 0.12 and triggered "attempt to call method 'range'
+# (a nil value)" crashes in the treesitter highlighter on markdown.
+# Bump deliberately when upstream nvim-treesitter master regains 0.12
+# support (or when we migrate the plugin spec to its `main` branch).
 # Debian's apt nvim is too old for nvim-lspconfig (requires 0.11+).
-ARG NVIM_VERSION=stable
+ARG NVIM_VERSION=v0.11.7
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -486,7 +491,18 @@ RUN set -eu; \
         OLLAMA_URL="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
     fi; \
     cd /tmp; \
-    curl -fsSL -o ollama.tar.zst "${OLLAMA_URL}"; \
+    # The ollama tarball is ~1.2 GiB and GitHub's release CDN occasionally
+    # 502s mid-fetch. Aggressive retry survives transient flakes; -C - lets
+    # an aborted download resume from where it stopped instead of starting
+    # from byte 0 on each attempt.
+    curl -fsSL \
+        --retry 8 \
+        --retry-delay 5 \
+        --retry-all-errors \
+        --retry-connrefused \
+        -C - \
+        -o ollama.tar.zst \
+        "${OLLAMA_URL}"; \
     tar --zstd -xf ollama.tar.zst bin/ollama; \
     install -m 0755 bin/ollama /usr/local/bin/ollama; \
     rm -rf ollama.tar.zst bin/; \

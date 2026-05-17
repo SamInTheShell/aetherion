@@ -22,6 +22,11 @@ local want = {
 	"python",
 	"rust",
 	"markdown",
+	-- markdown_inline is required alongside markdown: the markdown parser
+	-- handles block structure and injects markdown_inline for everything
+	-- inline (links, emphasis, code spans). Without it the injection tree
+	-- returns nil and the highlighter crashes on `:range()`.
+	"markdown_inline",
 	"vimdoc",
 }
 

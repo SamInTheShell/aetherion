@@ -17,6 +17,11 @@ return {
 				"python",
 				"rust",
 				"markdown",
+				-- markdown_inline is required alongside markdown: markdown
+				-- parses block structure and injects markdown_inline for
+				-- inline content (links, emphasis, code spans). Missing it
+				-- crashes the highlighter on `:range()`.
+				"markdown_inline",
 				"vimdoc",
 			},
 			highlight = { enable = true },
