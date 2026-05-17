@@ -30,6 +30,17 @@ fi
 export PATH="${PATH}:/home/aetherion/.bun/bin"
 export PATH="${PATH}:/opt/node/bin"
 
+# ---- readline: make Ctrl-W match Alt-B's word boundaries ----------------
+# Two pieces are required, because two layers race for Ctrl-W:
+#   1. termios WERASE (kernel-level, whitespace-only) — disabled here so
+#      readline actually gets the keystroke.
+#   2. readline's \C-w binding — rebound to backward-kill-word, whose word
+#      definition (alphanumeric) matches backward-word / Alt-B.
+# Without (1), the bind in (2) is silently ignored and Ctrl-W keeps eating
+# URLs and paths whole.
+stty werase undef 2>/dev/null
+bind '"\C-w": backward-kill-word'
+
 # ---- convenience aliases ------------------------------------------------
 alias cursor='cursor-agent' # Doubtful this container will have Cursor IDE
 
