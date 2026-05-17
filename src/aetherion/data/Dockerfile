@@ -120,6 +120,10 @@ RUN apt-get update \
         iputils-ping \
         dnsutils \
         netcat-openbsd \
+        # socat: powers /etc/profile.d/aetherion-bridge.sh, which proxies
+        # in-container loopback services to the container's external
+        # interface so `--forward-…` flags can publish them.
+        socat \
         # --- editor + base CLI tooling ---
         # Note: nvim is NOT installed from apt — Debian 13 ships 0.10.x which
         # is too old for current nvim-lspconfig. See stage 3c below for the
@@ -460,6 +464,117 @@ RUN set -eu; \
     python3 -c "import debugpy; print('debugpy', debugpy.__version__)"
 
 # ---------------------------------------------------------------------------
+# Stage 3e: install the ollama CLI binary only (no server runners)
+# We use `ollama` as a *client* — pointed at a daemon on the host via
+# OLLAMA_HOST (typically http://host.docker.internal:11434). The official
+# tarball ships ~1GB of runner libraries (CUDA/ROCm/CPU variants) under
+# lib/ollama that are only loaded by `ollama serve`. We extract just the
+# `bin/ollama` member from the zstd-compressed tar and drop everything else,
+# keeping the image lean. zstd + GNU tar's --zstd flag come from stage 3a.
+# Ref: https://github.com/ollama/ollama/releases
+# ---------------------------------------------------------------------------
+ARG OLLAMA_VERSION=latest
+RUN set -eu; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) OLLAMA_ARCH=amd64 ;; \
+        arm64) OLLAMA_ARCH=arm64 ;; \
+        *) echo "unsupported arch: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
+    esac; \
+    if [ "${OLLAMA_VERSION}" = "latest" ]; then \
+        OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
+    else \
+        OLLAMA_URL="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
+    fi; \
+    cd /tmp; \
+    curl -fsSL -o ollama.tar.zst "${OLLAMA_URL}"; \
+    tar --zstd -xf ollama.tar.zst bin/ollama; \
+    install -m 0755 bin/ollama /usr/local/bin/ollama; \
+    rm -rf ollama.tar.zst bin/; \
+    ollama --version 2>/dev/null | head -1 || ollama help >/dev/null
+
+# ---------------------------------------------------------------------------
+# Stage 3f: install Node.js LTS from the upstream tarball
+#
+# We bun for the JS runtime where possible, but some vendor CLIs (openclaw
+# in particular — `engines: {"node": ">=22.16.0"}`) rely on node-specific
+# error-code semantics in their launcher scripts that bun doesn't replicate.
+# Real node is the path of least resistance: it ships its own npm/npx, so
+# tools that gate on `LookPath("npm")` or shell out to `npm install -g` are
+# all happy, and `#!/usr/bin/env node` shebangs resolve to a real node.
+#
+# Bun stays installed (stage 6) as a fast user-scoped runtime. It just stops
+# pretending to be node.
+# Ref: https://nodejs.org/dist/
+# ---------------------------------------------------------------------------
+ARG NODE_VERSION=v22.22.3
+ARG NODE_SHA256_AMD64=""
+ARG NODE_SHA256_ARM64=""
+RUN set -eu; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) NODE_ARCH=linux-x64;   NODE_SHA="${NODE_SHA256_AMD64}" ;; \
+        arm64) NODE_ARCH=linux-arm64; NODE_SHA="${NODE_SHA256_ARM64}" ;; \
+        *) echo "unsupported arch: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
+    esac; \
+    NODE_TARBALL="node-${NODE_VERSION}-${NODE_ARCH}.tar.xz"; \
+    cd /tmp; \
+    curl -fsSL -O "https://nodejs.org/dist/${NODE_VERSION}/${NODE_TARBALL}"; \
+    if [ -n "${NODE_SHA}" ]; then \
+        echo "${NODE_SHA}  ${NODE_TARBALL}" | sha256sum -c -; \
+    else \
+        echo "WARN: NODE_SHA256_${TARGETARCH:-host} unset — trusting TLS only"; \
+    fi; \
+    tar -C /opt -xJf "${NODE_TARBALL}"; \
+    mv "/opt/node-${NODE_VERSION}-${NODE_ARCH}" /opt/node; \
+    ln -sf /opt/node/bin/node     /usr/local/bin/node; \
+    ln -sf /opt/node/bin/npm      /usr/local/bin/npm; \
+    ln -sf /opt/node/bin/npx      /usr/local/bin/npx; \
+    ln -sf /opt/node/bin/corepack /usr/local/bin/corepack; \
+    rm -f "/tmp/${NODE_TARBALL}"; \
+    node --version; \
+    npm --version
+
+# Put /opt/node/bin on PATH for subsequent build stages so npm-installed
+# global binaries (stage 3g) and any downstream stages that need to invoke
+# them resolve without absolute paths. The user-scoped PATH set in stage 5
+# re-asserts this same entry alongside the user's other tool dirs.
+ENV PATH=/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---------------------------------------------------------------------------
+# Stage 3g: pre-install LSPs and vendor agent CLIs globally via npm
+#
+# Lands in /opt/node/lib/node_modules with bin shims at /opt/node/bin (on
+# PATH via the symlinks above). Installed as root before the aetherion user
+# exists — these are system-wide tools and the user's $HOME stays clean.
+#
+# Agent CLIs covered:
+#   gemini   (@google/gemini-cli)
+#   copilot  (@github/copilot)
+#   codex    (@openai/codex)
+#   pi       (@earendil-works/pi-coding-agent)
+#   openclaw (openclaw — needs real node, see stage 3f)
+# LSPs covered:
+#   tsc + typescript-language-server, pyright, vim-language-server
+# `npm cache clean --force` reclaims the tarball download cache.
+# ---------------------------------------------------------------------------
+RUN npm install -g --omit=dev --no-fund --no-audit \
+        typescript \
+        typescript-language-server \
+        pyright \
+        vim-language-server \
+        @google/gemini-cli \
+        @github/copilot \
+        @openai/codex \
+        @earendil-works/pi-coding-agent \
+        openclaw \
+ && command -v typescript-language-server \
+ && command -v gemini \
+ && command -v copilot \
+ && command -v codex \
+ && command -v pi \
+ && command -v openclaw \
+ && npm cache clean --force
+
+# ---------------------------------------------------------------------------
 # Stage 4: create the non-root user with rootless-podman-friendly subid maps
 # ---------------------------------------------------------------------------
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
@@ -475,6 +590,11 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
 # pick fuse-overlayfs (works without /dev/fuse passthrough on most hosts).
 COPY skeleton/etc/containers/ /etc/containers/
 
+# Loopback bridge hook — sourced by /etc/profile when an AETHERION_BRIDGE_PORTS
+# env var is set (the aetherion launcher does this for `--forward-<agent>`
+# convenience flags). See the script for the full explanation.
+COPY --chmod=0644 skeleton/etc/profile.d/aetherion-bridge.sh /etc/profile.d/aetherion-bridge.sh
+
 # ---------------------------------------------------------------------------
 # Stage 5: switch to non-root for all subsequent user-scoped tooling
 # ---------------------------------------------------------------------------
@@ -482,7 +602,7 @@ USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 
 ENV HOME=/home/${USERNAME} \
-    PATH=/home/${USERNAME}/.local/bin:/home/${USERNAME}/.bun/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/home/${USERNAME}/.local/bin:/home/${USERNAME}/.npm-global/bin:/home/${USERNAME}/.bun/bin:/usr/local/bin:/opt/node/bin:/usr/bin:/bin
 
 # ---------------------------------------------------------------------------
 # Stage 6: user-scoped tooling — uv (Python) and bun (JS/TS)
@@ -493,36 +613,16 @@ ENV HOME=/home/${USERNAME} \
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
  && uv --version
 
-# bun (Oven) — installs to $BUN_INSTALL/bin (~/.bun/bin). Bun bundles its own
-# package manager + bunx; we deliberately don't ship node/npm.
+# bun (Oven) — installs to $BUN_INSTALL/bin (~/.bun/bin). Bun stays as a
+# fast user-scoped JS runtime + bundler; real node + npm live system-wide
+# (stage 3f/3g) and are what tools like `ollama launch …` find on PATH.
 RUN curl -fsSL https://bun.sh/install | bash \
  && ${BUN_INSTALL}/bin/bun --version
 
-# node shim → bun. Bun's runtime is Node-compatible; this makes
-# `#!/usr/bin/env node` shebangs (which every globally-installed npm package
-# wrapper carries) resolve to bun. Lets us use bun as the LSP runtime without
-# shipping a separate Node.js install. Must be created as root.
-USER root
-RUN ln -sf /home/${USERNAME}/.bun/bin/bun /usr/local/bin/node
-USER ${USERNAME}
-
-# Pre-install npm-based LSPs into ~/.bun/bin so Mason never has to (Mason
-# hardcodes `npm` for these and we don't ship npm). The explicit
-# vim.lsp.config blocks in lsp-config.lua resolve these by $PATH lookup.
-#
-# Gemini CLI (`gemini`) and GitHub Copilot CLI (`copilot`) are vendor
-# agent CLIs distributed as npm packages; they ride the same bun-as-node
-# shim.
-RUN ${BUN_INSTALL}/bin/bun add -g \
-        typescript \
-        typescript-language-server \
-        pyright \
-        vim-language-server \
-        @google/gemini-cli \
-        @github/copilot \
- && ${BUN_INSTALL}/bin/typescript-language-server --version \
- && command -v gemini \
- && command -v copilot
+# LSPs and vendor agent CLIs are installed system-wide in stage 3g via real
+# npm. They live in /opt/node/lib/node_modules with bin shims on PATH at
+# /opt/node/bin. The vim.lsp.config blocks in lsp-config.lua resolve these
+# by $PATH lookup.
 
 # Go-based LSP + DAP — install once at build so first-launch is offline-safe
 # and so we don't race Mason's `go install` against a root-owned module cache

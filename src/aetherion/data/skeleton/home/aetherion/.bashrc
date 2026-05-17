@@ -28,6 +28,7 @@ fi
 
 # ---- add bun bin to path ------------------------------------------------
 export PATH="${PATH}:/home/aetherion/.bun/bin"
+export PATH="${PATH}:/opt/node/bin"
 
 # ---- convenience aliases ------------------------------------------------
 alias cursor='cursor-agent' # Doubtful this container will have Cursor IDE

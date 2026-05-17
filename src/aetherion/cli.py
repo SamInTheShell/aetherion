@@ -13,6 +13,32 @@ from pathlib import Path
 DEFAULT_IMAGE = "localhost/aetherion:dev"
 CONTAINER_HOME = "/home/aetherion"
 
+# Port openclaw's gateway binds to inside the container. Fixed by openclaw
+# itself — we only control how (and whether) it's published to the host.
+OPENCLAW_GATEWAY_PORT = 18789
+
+# When a `--forward-<agent>` alias needs to bridge an in-container loopback
+# service, the socat bridge has to listen on a port DIFFERENT from the
+# service's real port. Services (e.g. openclaw) do their own port-availability
+# probes at startup — including transient wildcard binds — and a specific
+# bind to <eth0>:<service_port> by us makes those probes fail with EADDRINUSE.
+# By picking bridge_port = service_port + 40000 we sidestep the collision
+# entirely. `-p` then forwards the host's chosen port to bridge_port, and
+# socat fans out to 127.0.0.1:service_port internally.
+BRIDGE_PORT_OFFSET = 40000
+
+
+def _bridge_port_for(service_port: int) -> int:
+    bp = service_port + BRIDGE_PORT_OFFSET
+    if bp > 65535:
+        # Fold back if the service port itself is already high.
+        bp = service_port - 10000
+    if not (1 <= bp <= 65535):
+        raise ValueError(
+            f"could not compute a bridge port for service port {service_port}"
+        )
+    return bp
+
 # Files shipped alongside the launcher that together form the docker build
 # context. Order is purely cosmetic (used in log output).
 BUNDLED_ASSETS: tuple[str, ...] = ("Dockerfile", "skeleton", "scripts")
@@ -23,10 +49,20 @@ BUNDLED_ASSETS: tuple[str, ...] = ("Dockerfile", "skeleton", "scripts")
 # owned by that agent — keep new paths grouped under the agent that owns
 # them so `--agents <name>` slicing keeps working with no extra plumbing.
 AGENT_PATHS: dict[str, tuple[str, ...]] = {
-    "claude":  (".claude", ".claude.json"),
-    "cursor":  (".cursor", ".config/cursor"),
-    "copilot": (".copilot",),
-    "gemini":  (".gemini",),
+    "claude":   (".claude", ".claude.json"),
+    "cursor":   (".cursor", ".config/cursor"),
+    "copilot":  (".copilot",),
+    "gemini":   (".gemini",),
+    "codex":    (".codex",),
+    "pi":       (".pi",),
+    "openclaw": (".openclaw",),
+    # Not an agent in its own right — this is the user-scoped npm prefix
+    # (~/.npmrc redirects `npm install -g` here) plus npm's tarball/metadata
+    # cache. Agents that install plugins at runtime (e.g. `ollama launch pi`
+    # -> `@ollama/pi-web-search`) land their packages under .npm-global; the
+    # cache at .npm/_cacache means even when those tools unconditionally rerun
+    # `npm update <pkg>` on launch, npm serves from disk instead of re-fetching.
+    "npm":      (".npm-global", ".npm"),
 }
 
 
@@ -136,7 +172,105 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "with no `=` inherits the value from the host environment."
         ),
     )
+    parser.add_argument(
+        "--forward",
+        action="append",
+        default=[],
+        metavar="[ADDR:[HOST_PORT:]]CONTAINER_PORT",
+        help=(
+            "Publish a container port to the host (podman/docker `-p` "
+            "semantics). Repeatable. Forms: `CONTAINER_PORT` (host bind "
+            "127.0.0.1, host port matches), `HOST_PORT:CONTAINER_PORT`, "
+            "`ADDR:HOST_PORT:CONTAINER_PORT`, `:HOST_PORT:CONTAINER_PORT` "
+            "(empty addr = 127.0.0.1), `[::1]:HOST:CONTAINER` (IPv6). "
+            "Note: services that bind 127.0.0.1 inside the container "
+            "(common default) won't be reachable through `--forward` alone "
+            "— use a `--forward-<agent>` alias, which also sets up a "
+            "loopback bridge."
+        ),
+    )
+    parser.add_argument(
+        "--forward-openclaw",
+        metavar="[ADDR][:PORT]",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            f"Convenience alias for OpenClaw's gateway (container port "
+            f"{OPENCLAW_GATEWAY_PORT}). Publishes the port AND sets up the "
+            "loopback bridge required to reach it (openclaw binds 127.0.0.1 "
+            "inside the container). Forms: bare (127.0.0.1:18789), `ADDR` "
+            "(port stays 18789), `PORT` (addr stays 127.0.0.1), `ADDR:PORT`, "
+            "or `:PORT`."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _build_alias_publish_spec(raw: str, service_port: int, bridge_port: int) -> str:
+    """Turn a `--forward-<agent>` value into a podman/docker -p spec
+    (HOST_BIND:HOST_PORT:CONTAINER_PORT). The container-side port published
+    by `-p` is the *bridge* port — socat listens there and forwards to the
+    real service port on 127.0.0.1 internally. Host-side port still defaults
+    to the service port so URLs the service prints (e.g.
+    `http://127.0.0.1:18789`) match what the user opens.
+    """
+    default_addr = "127.0.0.1"
+
+    if raw == "":
+        return f"{default_addr}:{service_port}:{bridge_port}"
+
+    if ":" in raw:
+        # rpartition handles `[::1]:9999` correctly — the right-most ':' is
+        # always the addr/port separator. `:9999` (empty addr) is also fine.
+        addr, _, port_str = raw.rpartition(":")
+        addr = addr or default_addr
+        host_port = int(port_str)
+    elif raw.isdigit():
+        addr = default_addr
+        host_port = int(raw)
+    else:
+        addr = raw
+        host_port = service_port
+
+    if not (1 <= host_port <= 65535):
+        raise ValueError(f"--forward-* host port out of range: {host_port}")
+    return f"{addr}:{host_port}:{bridge_port}"
+
+
+def _parse_forward_spec(raw: str) -> str:
+    """Turn a `--forward` value into a podman/docker -p spec
+    (HOST_BIND:HOST_PORT:CONTAINER_PORT).
+
+    Forms (right-most colon always separates the container port):
+        CONTAINER_PORT                           → 127.0.0.1:CONTAINER:CONTAINER
+        HOST_PORT:CONTAINER_PORT                 → 127.0.0.1:HOST:CONTAINER
+        ADDR:HOST_PORT:CONTAINER_PORT            → ADDR:HOST:CONTAINER
+        :HOST_PORT:CONTAINER_PORT                → 127.0.0.1:HOST:CONTAINER
+        [::1]:HOST_PORT:CONTAINER_PORT           → [::1]:HOST:CONTAINER  (IPv6)
+    """
+    default_addr = "127.0.0.1"
+
+    if ":" not in raw:
+        port = int(raw)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"--forward port out of range: {port}")
+        return f"{default_addr}:{port}:{port}"
+
+    rest, _, container_str = raw.rpartition(":")
+    container_port = int(container_str)
+    if ":" not in rest:
+        host_port = int(rest)
+        addr = default_addr
+    else:
+        addr, _, host_str = rest.rpartition(":")
+        addr = addr or default_addr
+        host_port = int(host_str)
+
+    for label, p in (("host", host_port), ("container", container_port)):
+        if not (1 <= p <= 65535):
+            raise ValueError(f"--forward {label} port out of range: {p}")
+    return f"{addr}:{host_port}:{container_port}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -245,6 +379,36 @@ def main(argv: list[str] | None = None) -> int:
         for kv in args.env:
             env_args += ["-e", kv]
 
+        # Port publishing. `--forward` is the generic flag (podman/docker
+        # `-p` semantics); `--forward-<agent>` flags are convenience aliases
+        # that also enroll the container port in AETHERION_BRIDGE_PORTS so
+        # /etc/profile.d/aetherion-bridge.sh stands up a loopback bridge —
+        # required for services that hardcode 127.0.0.1 as their bind, since
+        # `-p` forwarding terminates at the container's external interface.
+        publish_args: list[str] = []
+        # Each pair is (service_port, bridge_port). socat inside the container
+        # listens on bridge_port and forwards to 127.0.0.1:service_port.
+        bridge_pairs: list[tuple[int, int]] = []
+        try:
+            for raw in args.forward:
+                publish_args += ["-p", _parse_forward_spec(raw)]
+            if args.forward_openclaw is not None:
+                bp = _bridge_port_for(OPENCLAW_GATEWAY_PORT)
+                publish_args += [
+                    "-p",
+                    _build_alias_publish_spec(args.forward_openclaw, OPENCLAW_GATEWAY_PORT, bp),
+                ]
+                bridge_pairs.append((OPENCLAW_GATEWAY_PORT, bp))
+        except ValueError as e:
+            sys.stderr.write(f"aetherion: {e}\n")
+            return 2
+
+        if bridge_pairs:
+            env_args += [
+                "-e",
+                f"AETHERION_BRIDGE_PORTS={','.join(f'{s}:{b}' for s, b in bridge_pairs)}",
+            ]
+
         run_argv = [
             CONTAINER_RUNTIME, "run",
             *user_ns_args(),
@@ -252,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             "--hostname", instance_id,
             "--cidfile", str(cidfile),
             *env_args,
+            *publish_args,
             "-v", f"{pwd}:{container_workdir}:z",
             "-w", container_workdir,
             *mounts,
