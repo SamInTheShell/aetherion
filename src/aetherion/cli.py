@@ -56,6 +56,7 @@ AGENT_PATHS: dict[str, tuple[str, ...]] = {
     "codex":    (".codex",),
     "pi":       (".pi",),
     "openclaw": (".openclaw",),
+    "hermes":   (".hermes",),
     # Not an agent in its own right — this is the user-scoped npm prefix
     # (~/.npmrc redirects `npm install -g` here) plus npm's tarball/metadata
     # cache. Agents that install plugins at runtime (e.g. `ollama launch pi`

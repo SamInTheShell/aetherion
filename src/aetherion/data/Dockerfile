@@ -659,6 +659,16 @@ RUN go install golang.org/x/tools/gopls@latest \
 RUN uv tool install --python 3.13 posting \
  && posting --help >/dev/null
 
+# Hermes Agent (https://github.com/NousResearch/hermes-agent) — Nous Research's
+# self-improving CLI agent. Distributed as the `hermes-agent` PyPI package with
+# a `hermes` entry point; same uv-tool shape as posting above, so it lands at
+# ~/.local/share/uv/tools/hermes-agent with the launcher in ~/.local/bin.
+# Hermes requires Python >=3.11; 3.13 is fine and lets us reuse posting's
+# interpreter. Config/state lives in ~/.hermes (HERMES_HOME) — the launcher's
+# AGENT_PATHS entry preserves that across sessions.
+RUN uv tool install --python 3.13 hermes-agent \
+ && hermes --help >/dev/null
+
 # Cursor Agent (`cursor-agent`) — vendor agent CLI from Cursor. Distributed
 # as a prebuilt binary via an upstream install script; lands in
 # ~/.local/bin/cursor-agent (already on PATH). Trust here is TLS to

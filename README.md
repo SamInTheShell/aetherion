@@ -4,7 +4,7 @@ A containerized development environment for AI coding agents.
 
 Ships a Debian dev container preloaded with the bundled agent CLIs (Claude
 Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi,
-OpenClaw), the Ollama client for running them against a local model
+OpenClaw, Hermes), the Ollama client for running them against a local model
 daemon on the host, Neovim with LSP/DAP support, podman-in-podman, and
 toolchains for Python, Node, Go, Rust, and Ruby. The `aetherion` launcher
 mounts the current directory at the same path inside the container and
@@ -47,6 +47,7 @@ so it routes through the daemon, then execs the agent for you. Tested:
 
 ```shell
 OLLAMA_HOST=http://host.docker.internal:11434 ollama launch pi
+OLLAMA_HOST=http://host.docker.internal:11434 ollama launch hermes
 OLLAMA_HOST=http://host.docker.internal:11434 ollama launch openclaw
 OLLAMA_HOST=http://host.docker.internal:11434 ollama launch codex
 OLLAMA_HOST=http://host.docker.internal:11434 ollama launch claude
@@ -85,7 +86,7 @@ it just isn't pretending to be node.
 ## What's in the container
 
 - **Languages & runtimes**: Python (system + uv), Node.js LTS + bun, Go, Rust, Ruby, C/C++ toolchain
-- **Agent CLIs**: Claude Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw
+- **Agent CLIs**: Claude Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw, Hermes
 - **Editor**: Neovim with bundled LSPs (`pyright`, `gopls`, `rust-analyzer`, `lua-language-server`, `typescript-language-server`, `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`, `js-debug-adapter`)
 - **CLI tools**: git, podman, tmux, starship, ripgrep, fd, fzf, jq, yq, posting, openssh-client, ollama (client only — point at a host daemon via `OLLAMA_HOST`)
 
@@ -105,6 +106,7 @@ Subsequent launches bind-mount the saved config so you stay logged in.
 | `codex` | `.codex/` |
 | `pi` | `.pi/` |
 | `openclaw` | `.openclaw/` |
+| `hermes` | `.hermes/` |
 | `npm` | `.npm-global/`, `.npm/` (user-scoped npm prefix + cache — preserves runtime-installed plugins like `@ollama/pi-web-search` and avoids re-fetching them when an agent reruns `npm update` on launch) |
 
 ## Flags
