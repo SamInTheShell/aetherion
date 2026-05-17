@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aetherion"
+version = "0.1.0"
+description = "Dev container launcher for AI coding agents"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+aetherion = "aetherion.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aetherion"]
