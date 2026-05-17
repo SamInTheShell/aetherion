@@ -18,6 +18,12 @@ uv tool install aetherion
 
 (or `pipx install aetherion`)
 
+To upgrade later:
+
+```shell
+uv tool upgrade aetherion
+```
+
 ## Quickstart
 
 ```shell
