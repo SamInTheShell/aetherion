@@ -434,6 +434,11 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             if deferred:
+                # Status line because on slower hosts the cp+rm phase can take
+                # a couple seconds — without this the shell appears to hang
+                # after `logout`, and the natural reflex is Ctrl+C.
+                sys.stderr.write("aetherion: cleaning up container...\n")
+                sys.stderr.flush()
                 preserve_agent_state(cid, deferred, data_dir)
         finally:
             subprocess.run(
@@ -499,43 +504,17 @@ def _extract_bundle(dest: Path) -> int:
 
 
 def preserve_agent_state(cid: str, deferred: list[tuple[str, str]], data_dir: Path) -> None:
-    # Use `<runtime> diff` to find which deferred paths the container actually
-    # touched. Skipping `cp` on untouched paths avoids spurious errors and
-    # keeps the host clean of empty agent dirs from sessions where the user
-    # never logged in.
-    touched = _diff_paths(cid)
+    # Try `<runtime> cp` directly for each deferred path. cp returns non-zero
+    # when the source path doesn't exist in the container, which we treat as
+    # "agent was never used this session, skip". We used to run `<runtime>
+    # diff` first to filter, but that walks the entire container filesystem;
+    # on a rich dev image the walk is slow enough that exit feels like a
+    # hang. Going straight to cp is O(deferred paths) instead.
     for agent, rel in deferred:
         container_path = f"{CONTAINER_HOME}/{rel}"
-        if not _was_touched(container_path, touched):
-            continue
         host_path = data_dir / rel
         if extract(cid, container_path, host_path):
             sys.stderr.write(f"aetherion: preserved {agent} state at {host_path}\n")
-
-
-def _diff_paths(cid: str) -> set[str]:
-    """Return the set of container-fs paths reported as Added or Changed by
-    `<runtime> diff`. Deletes are ignored — nothing to extract."""
-    result = subprocess.run(
-        [CONTAINER_RUNTIME, "diff", cid],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return set()
-    paths: set[str] = set()
-    for line in result.stdout.splitlines():
-        kind, _, path = line.partition(" ")
-        if kind in ("A", "C") and path:
-            paths.add(path)
-    return paths
-
-
-def _was_touched(target: str, touched: set[str]) -> bool:
-    if target in touched:
-        return True
-    prefix = target + "/"
-    return any(p.startswith(prefix) for p in touched)
 
 
 def extract(cid: str, src_in_container: str, dst_on_host: Path) -> bool:
