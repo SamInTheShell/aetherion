@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.metadata
 import os
 import secrets
@@ -719,9 +720,31 @@ def extract(cid: str, src_in_container: str, dst_on_host: Path) -> bool:
 
     # Defensive: dst shouldn't exist (deferred = not on host at launch), but
     # if a concurrent run raced us, clear it so os.replace can land cleanly
-    # even when staging is a directory.
-    _remove(dst_on_host)
-    os.replace(staging, dst_on_host)
+    # even when staging is a directory. If that clear fails (ENOTEMPTY) or
+    # the replace fails, another aetherion container is actively writing the
+    # same path — its os.replace landed an atomic snapshot under us, and
+    # ours would either overwrite half of it or hit a deeper race. Keep the
+    # other session's copy on disk; discard our staging. The user sees a
+    # one-line note explaining the situation, not a traceback.
+    try:
+        _remove(dst_on_host)
+        os.replace(staging, dst_on_host)
+    except OSError as e:
+        if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            sys.stderr.write(
+                f"aetherion: skipped {dst_on_host.name}: another aetherion "
+                f"session is writing {dst_on_host} concurrently. Kept the "
+                f"other session's copy; this session's changes were "
+                f"discarded. (Normal when running multiple aetherion "
+                f"containers in parallel — no action needed.)\n"
+            )
+        else:
+            sys.stderr.write(
+                f"aetherion: failed to preserve {dst_on_host}: {e}. "
+                f"This session's changes were discarded.\n"
+            )
+        _remove(staging)
+        return False
     return True
 
 
