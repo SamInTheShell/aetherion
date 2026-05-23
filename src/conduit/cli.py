@@ -43,6 +43,17 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
+    # Split at the first bare `--`: everything after is passthrough to the
+    # agent binary (e.g. `conduit launch claude -- --debug`). Doing this
+    # *before* argparse means agent flags can't accidentally collide with
+    # ours — claude's `--model`, codex's `--profile`, etc. all reach the
+    # agent verbatim.
+    if "--" in argv:
+        sep = argv.index("--")
+        argv_for_parse, passthrough = argv[:sep], argv[sep + 1:]
+    else:
+        argv_for_parse, passthrough = argv, []
+
     parser = argparse.ArgumentParser(
         prog="conduit",
         description=(
@@ -77,9 +88,39 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    sub.add_parser(
+        "list-models",
+        help="List models available at the configured endpoint (alphabetical).",
+        description=(
+            "Print every model the configured endpoint reports at "
+            "/v1/models, one per line, sorted alphabetically. No model "
+            "selection — use this to discover ids you can then pass to "
+            "`conduit launch <agent> <model>`."
+        ),
+    )
+
     launch_p = sub.add_parser(
         "launch",
         help="Launch a coding agent against the configured endpoint.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Launch a coding agent. With no model supplied, the configured "
+            "endpoint is queried for available models and an interactive "
+            "picker runs. With a MODEL positional, the picker is skipped "
+            "and the model is validated against the endpoint's list. Pass "
+            "additional arguments through to the agent binary after `--`."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  conduit launch pi\n"
+            "        interactive model picker, then launch pi\n"
+            "  conduit launch claude qwen2.5:7b\n"
+            "        skip the picker, launch claude with qwen2.5:7b\n"
+            "  conduit launch codex -- --search 'goroutines'\n"
+            "        picker, then forward `--search goroutines` to codex\n"
+            "  conduit launch openclaw llama3:8b -- daemon stop\n"
+            "        pinned model + forward `daemon stop` to openclaw\n"
+        ),
     )
     launch_p.add_argument(
         "integration",
@@ -91,12 +132,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Which agent to launch.",
     )
     launch_p.add_argument(
-        "args",
-        nargs=argparse.REMAINDER,
-        help="Extra arguments forwarded to the agent's binary.",
+        "model",
+        nargs="?",
+        metavar="MODEL",
+        help=(
+            "Model id to use, as reported by the endpoint's /v1/models. "
+            "Omit to choose interactively. Validated against the endpoint "
+            "before launch; an unknown id errors with the available list."
+        ),
     )
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv_for_parse)
 
     # Bare `conduit` → top-level help.
     if args.command is None:
@@ -113,8 +159,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "set" and args.key == "endpoint":
         return _cmd_set_endpoint(args.value)
+    if args.command == "list-models":
+        return _cmd_list_models()
     if args.command == "launch":
-        return _cmd_launch(args.integration, args.args or [])
+        return _cmd_launch(args.integration, args.model, passthrough)
     parser.print_help()
     return 0
 
@@ -134,7 +182,29 @@ def _cmd_set_endpoint(value: str) -> int:
     return 0
 
 
-def _cmd_launch(name: str, extra_args: list[str]) -> int:
+def _cmd_list_models() -> int:
+    s = settings_mod.load()
+    if not s.endpoint:
+        sys.stderr.write(
+            "conduit: no endpoint configured. Set one first, e.g.:\n"
+            "  conduit set endpoint ollama\n"
+            "  conduit set endpoint lmstudio\n"
+            "  conduit set endpoint https://my-llm.example.com\n"
+        )
+        return 2
+    try:
+        models = endpoint_mod.list_models(s.endpoint)
+    except endpoint_mod.EndpointError as e:
+        sys.stderr.write(f"conduit: {e}\n")
+        return 1
+    # Print to stdout (not stderr) so users can pipe to grep/sort/wc without
+    # losing the data to stderr-only filters.
+    for name in sorted(models):
+        print(name)
+    return 0
+
+
+def _cmd_launch(name: str, model_override: str | None, extra_args: list[str]) -> int:
     integration = INTEGRATIONS[name]
     s = settings_mod.load()
     if not s.endpoint:
@@ -152,15 +222,29 @@ def _cmd_launch(name: str, extra_args: list[str]) -> int:
         sys.stderr.write(f"conduit: {e}\n")
         return 1
 
-    last = s.last_models.get(name)
-    chosen = picker.pick(
-        f"Select a model for {name} (via {s.endpoint_alias or s.endpoint}):",
-        models,
-        default=last,
-    )
-    if chosen is None:
-        sys.stderr.write("conduit: cancelled.\n")
-        return 130
+    if model_override is not None:
+        # Validate against the endpoint's catalog so a typo doesn't silently
+        # launch the agent against a model the server can't actually serve.
+        if model_override not in models:
+            sys.stderr.write(
+                f"conduit: model {model_override!r} is not available at "
+                f"{s.endpoint_alias or s.endpoint}.\n"
+                f"conduit: available models:\n"
+            )
+            for m in models:
+                sys.stderr.write(f"  - {m}\n")
+            return 2
+        chosen = model_override
+    else:
+        last = s.last_models.get(name)
+        chosen = picker.pick(
+            f"Select a model for {name} (via {s.endpoint_alias or s.endpoint}):",
+            models,
+            default=last,
+        )
+        if chosen is None:
+            sys.stderr.write("conduit: cancelled.\n")
+            return 130
 
     s.last_models[name] = chosen
     settings_mod.save(s)
