@@ -40,8 +40,19 @@ def _bridge_port_for(service_port: int) -> int:
     return bp
 
 # Files shipped alongside the launcher that together form the docker build
-# context. Order is purely cosmetic (used in log output).
-BUNDLED_ASSETS: tuple[str, ...] = ("Dockerfile", "skeleton", "scripts")
+# context. Order is purely cosmetic (used in log output). `aetherion-src/`
+# is a placeholder directory that the Dockerfile COPYs in; the launcher
+# overlays it with the live repo contents when building from a checkout,
+# so `uv tool install /tmp/aetherion-src` inside the build picks up local
+# edits without a PyPI publish. In installed-mode builds the dir stays
+# empty (its only payload is a .keep file) and the Dockerfile's default
+# AETHERION_SPEC=aetherion installs the published wheel instead.
+BUNDLED_ASSETS: tuple[str, ...] = (
+    "Dockerfile",
+    "skeleton",
+    "scripts",
+    "aetherion-src",
+)
 
 # Per-agent state we preserve on the host so that login or first-run setup
 # done inside one container session survives into the next. Each tuple lists
@@ -57,12 +68,15 @@ AGENT_PATHS: dict[str, tuple[str, ...]] = {
     "pi":       (".pi",),
     "openclaw": (".openclaw",),
     "hermes":   (".hermes",),
+    # Not an agent itself — conduit's settings (endpoint choice + last-used
+    # model per integration). Preserving the dir lets `conduit set endpoint`
+    # in one session take effect in the next without re-running it.
+    "conduit":  (".conduit",),
     # Not an agent in its own right — this is the user-scoped npm prefix
     # (~/.npmrc redirects `npm install -g` here) plus npm's tarball/metadata
-    # cache. Agents that install plugins at runtime (e.g. `ollama launch pi`
-    # -> `@ollama/pi-web-search`) land their packages under .npm-global; the
-    # cache at .npm/_cacache means even when those tools unconditionally rerun
-    # `npm update <pkg>` on launch, npm serves from disk instead of re-fetching.
+    # cache. Agents that install plugins at runtime land their packages
+    # under .npm-global; the cache at .npm/_cacache means subsequent
+    # `npm update <pkg>` calls serve from disk instead of re-fetching.
     "npm":      (".npm-global", ".npm"),
 }
 
@@ -96,6 +110,47 @@ def user_ns_args() -> list[str]:
     if _RUNTIME_IS_DOCKER:
         return ["--user", "1000:1000"]
     return ["--userns=keep-id:uid=1000,gid=1000"]
+
+
+def network_args() -> list[str]:
+    # Docker on every platform routes the bridge gateway IP through to
+    # whatever the host's 127.0.0.1 is reachable as (a VM proxy on macOS /
+    # Windows, the docker bridge on Linux), so the `--add-host` mapping is
+    # enough on its own. Podman rootless on Linux is the odd one out: its
+    # default slirp4netns network includes a proxy from the gateway IP
+    # (10.0.2.2) to the host's loopback, but that proxy is *disabled* by
+    # default for hardening, which is why an LM Studio / Ollama bound on
+    # 127.0.0.1 refuses connections from inside the container. Turning on
+    # `allow_host_loopback` flips that proxy on so connections to the
+    # gateway IP actually complete on the host's loopback. We skip it on
+    # rootful podman (where bridge networking already reaches host
+    # loopback) and on docker; passing the slirp4netns specifier in those
+    # modes would force the wrong network backend.
+    if _RUNTIME_IS_DOCKER:
+        return []
+    if os.geteuid() == 0:
+        return []
+    return ["--network", "slirp4netns:allow_host_loopback=true"]
+
+
+def host_internal_args() -> list[str]:
+    """Map `host.docker.internal` inside the container to whatever IP
+    actually reaches the host's loopback under the active runtime."""
+    if _RUNTIME_IS_DOCKER or os.geteuid() == 0:
+        # Docker (any platform) and rootful podman both wire host-gateway
+        # to a bridge IP that already routes to the host's loopback, so
+        # the symbolic keyword works.
+        return ["--add-host", "host.docker.internal:host-gateway"]
+    # Rootless podman: the host-gateway keyword resolves to the container's
+    # default route, which on the host's LAN points at the physical
+    # interface (a 192.168.x / 10.x address). Traffic to that IP leaves
+    # the host entirely instead of crossing slirp4netns's proxy, so a
+    # service bound to 127.0.0.1 is unreachable. Pin the hostname directly
+    # to the slirp4netns gateway IP — paired with `allow_host_loopback`
+    # above, that's the path that proxies into the host's loopback.
+    # 10.0.2.2 is slirp4netns's default gateway IP, and we don't override
+    # the default CIDR, so it's the same for everyone on rootless podman.
+    return ["--add-host", "host.docker.internal:10.0.2.2"]
 
 
 def _bundled_assets_dir() -> Path:
@@ -149,6 +204,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "Directory to use as the build context. Must contain a Dockerfile. "
             "Combine with --build-image to build from a customized copy "
             "(see --extract)."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-layers",
+        action="store_true",
+        help=(
+            "Discard the runtime's build cache for this build "
+            "(podman/docker `--no-cache`). Use when you suspect a cached "
+            "intermediate layer is stale — apt mirrors, upstream installer "
+            "scripts, npm registry — and you want a from-scratch run. "
+            "Only meaningful alongside --build-image."
         ),
     )
     parser.add_argument(
@@ -304,12 +370,20 @@ def main(argv: list[str] | None = None) -> int:
     # --build-image is terminal: it never launches the container, regardless
     # of build success or failure. The build's exit code propagates as-is.
     if args.build_image:
-        context = (
-            Path(args.build_dir).expanduser().resolve()
-            if args.build_dir is not None
-            else _bundled_assets_dir()
-        )
-        return _build_image(image, context)
+        if args.build_dir is not None:
+            # User-managed context: build it verbatim. Anyone using --build-dir
+            # has either run --extract (which ships an empty aetherion-src/
+            # placeholder) or wired their own equivalent, so the Dockerfile's
+            # COPY succeeds either way. Dev-mode overlay is reserved for the
+            # default path below.
+            return _build_image(
+                image,
+                Path(args.build_dir).expanduser().resolve(),
+                refresh_layers=args.refresh_layers,
+            )
+        with tempfile.TemporaryDirectory(prefix="aetherion-build-") as td:
+            ctx = _stage_build_context(Path(td))
+            return _build_image(image, ctx, refresh_layers=args.refresh_layers)
 
     if not _image_exists(image):
         sys.stderr.write(
@@ -413,9 +487,11 @@ def main(argv: list[str] | None = None) -> int:
         run_argv = [
             CONTAINER_RUNTIME, "run",
             *user_ns_args(),
+            *network_args(),
             "--name", instance_name,
             "--hostname", instance_id,
             "--cidfile", str(cidfile),
+            *host_internal_args(),
             *env_args,
             *publish_args,
             "-v", f"{pwd}:{container_workdir}:z",
@@ -434,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             if deferred:
+                # Status line because on slower hosts the cp+rm phase can take
+                # a couple seconds — without this the shell appears to hang
+                # after `logout`, and the natural reflex is Ctrl+C.
+                sys.stderr.write("aetherion: cleaning up container...\n")
+                sys.stderr.flush()
                 preserve_agent_state(cid, deferred, data_dir)
         finally:
             subprocess.run(
@@ -453,7 +534,7 @@ def _image_exists(image: str) -> bool:
     ).returncode == 0
 
 
-def _build_image(image: str, context: Path) -> int:
+def _build_image(image: str, context: Path, *, refresh_layers: bool = False) -> int:
     if not context.is_dir():
         sys.stderr.write(f"aetherion: build context does not exist: {context}\n")
         return 1
@@ -463,10 +544,83 @@ def _build_image(image: str, context: Path) -> int:
             "aetherion: run `aetherion --extract <path>` to populate one.\n"
         )
         return 1
+
+    # If the build context's aetherion-src/ overlay carries a pyproject.toml,
+    # the launcher (or the user, via --build-dir) has staged a local source
+    # tree there. Point the Dockerfile's `uv tool install` at it instead of
+    # the default `aetherion` PyPI spec, so in-progress edits flow into the
+    # container without a publish.
+    build_args: list[str] = []
+    if (context / "aetherion-src" / "pyproject.toml").is_file():
+        build_args = ["--build-arg", "AETHERION_SPEC=/tmp/aetherion-src"]
+
+    # --refresh-layers maps directly to the runtime's `--no-cache`. Same
+    # flag name in podman and docker, so no per-runtime branching needed.
+    cache_args: list[str] = ["--no-cache"] if refresh_layers else []
+    if refresh_layers:
+        sys.stderr.write("aetherion: --refresh-layers: ignoring layer cache\n")
+
     sys.stderr.write(f"aetherion: building {image} from {context}\n")
     return subprocess.run(
-        [CONTAINER_RUNTIME, "build", "-t", image, str(context)],
+        [CONTAINER_RUNTIME, "build", *cache_args, *build_args, "-t", image, str(context)],
     ).returncode
+
+
+def _find_repo_root() -> Path | None:
+    """Return the repo root iff the launcher is running from a source checkout
+    where both src/aetherion/ and src/conduit/ live as siblings. Used by the
+    build path to overlay live source into the container so edits land
+    inside without a PyPI publish. Returns None for installed-from-wheel
+    runs, where the only available source is whatever the wheel shipped."""
+    here = Path(__file__).resolve()
+    for ancestor in here.parents:
+        if (
+            (ancestor / "pyproject.toml").is_file()
+            and (ancestor / "src" / "aetherion" / "__init__.py").is_file()
+            and (ancestor / "src" / "conduit" / "__init__.py").is_file()
+        ):
+            return ancestor
+    return None
+
+
+def _stage_build_context(dest: Path) -> Path:
+    """Materialize a docker build context under `dest`: copy bundled assets in,
+    then (when running from a source checkout) overlay the repo's pyproject +
+    src/ trees under aetherion-src/ so the Dockerfile's
+    `uv tool install /tmp/aetherion-src` picks up live edits. Returns the
+    populated context dir."""
+    bundle = _bundled_assets_dir()
+    for name in BUNDLED_ASSETS:
+        src, dst = bundle / name, dest / name
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        elif src.is_file():
+            shutil.copy2(src, dst)
+
+    repo = _find_repo_root()
+    if repo is not None:
+        overlay = dest / "aetherion-src"
+        # Wipe the .keep placeholder so the overlay isn't polluted by it. The
+        # Dockerfile install path doesn't care, but leaving the stub lying
+        # around inside `uv tool install`'s source tree is just noise.
+        if overlay.exists():
+            shutil.rmtree(overlay)
+        overlay.mkdir()
+        for name in ("pyproject.toml", "README.md", "LICENSE"):
+            src = repo / name
+            if src.is_file():
+                shutil.copy2(src, overlay / name)
+        shutil.copytree(
+            repo / "src",
+            overlay / "src",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        sys.stderr.write(
+            f"aetherion: dev mode — overlaying repo source from {repo} "
+            "into build context (live edits to src/conduit/ will land in "
+            "the container without a publish)\n"
+        )
+    return dest
 
 
 def _extract_bundle(dest: Path) -> int:
@@ -499,43 +653,17 @@ def _extract_bundle(dest: Path) -> int:
 
 
 def preserve_agent_state(cid: str, deferred: list[tuple[str, str]], data_dir: Path) -> None:
-    # Use `<runtime> diff` to find which deferred paths the container actually
-    # touched. Skipping `cp` on untouched paths avoids spurious errors and
-    # keeps the host clean of empty agent dirs from sessions where the user
-    # never logged in.
-    touched = _diff_paths(cid)
+    # Try `<runtime> cp` directly for each deferred path. cp returns non-zero
+    # when the source path doesn't exist in the container, which we treat as
+    # "agent was never used this session, skip". We used to run `<runtime>
+    # diff` first to filter, but that walks the entire container filesystem;
+    # on a rich dev image the walk is slow enough that exit feels like a
+    # hang. Going straight to cp is O(deferred paths) instead.
     for agent, rel in deferred:
         container_path = f"{CONTAINER_HOME}/{rel}"
-        if not _was_touched(container_path, touched):
-            continue
         host_path = data_dir / rel
         if extract(cid, container_path, host_path):
             sys.stderr.write(f"aetherion: preserved {agent} state at {host_path}\n")
-
-
-def _diff_paths(cid: str) -> set[str]:
-    """Return the set of container-fs paths reported as Added or Changed by
-    `<runtime> diff`. Deletes are ignored — nothing to extract."""
-    result = subprocess.run(
-        [CONTAINER_RUNTIME, "diff", cid],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return set()
-    paths: set[str] = set()
-    for line in result.stdout.splitlines():
-        kind, _, path = line.partition(" ")
-        if kind in ("A", "C") and path:
-            paths.add(path)
-    return paths
-
-
-def _was_touched(target: str, touched: set[str]) -> bool:
-    if target in touched:
-        return True
-    prefix = target + "/"
-    return any(p.startswith(prefix) for p in touched)
 
 
 def extract(cid: str, src_in_container: str, dst_on_host: Path) -> bool:
