@@ -105,6 +105,7 @@ Subsequent launches bind-mount the saved config so you stay logged in.
 | `hermes` | `.hermes/` |
 | `conduit` | `.conduit/` (endpoint choice + last-model-per-integration) |
 | `npm` | `.npm-global/`, `.npm/` (user-scoped npm prefix + cache — preserves runtime-installed agent plugins and avoids re-fetching when an agent reruns `npm update` on launch) |
+| `go` | `go/` (Go's GOPATH — `bin/` for user-installed Go tools plus `pkg/mod/` so the module cache survives between launches) |
 
 ## Flags
 

@@ -78,6 +78,13 @@ AGENT_PATHS: dict[str, tuple[str, ...]] = {
     # under .npm-global; the cache at .npm/_cacache means subsequent
     # `npm update <pkg>` calls serve from disk instead of re-fetching.
     "npm":      (".npm-global", ".npm"),
+    # Not an agent in its own right — this is Go's GOPATH (the Dockerfile
+    # pins it to ~/go). Holds compiled binaries under bin/ (gopls + dlv from
+    # the image build, plus anything the user `go install`s at runtime) and
+    # the module cache under pkg/mod. Preserving the whole tree keeps
+    # user-installed Go tools across sessions and avoids re-downloading
+    # modules every container launch.
+    "go":       ("go",),
 }
 
 

@@ -1,4 +1,4 @@
-.PHONY: help build publish clean
+.PHONY: help build install publish clean
 
 .DEFAULT_GOAL := help
 
@@ -9,6 +9,9 @@ help: ## Show this help
 
 build: clean ## Build sdist + wheel into dist/
 	uv build
+
+install: build ## Build then `uv tool install` the wheel, replacing any existing aetherion install
+	uv tool install --force --reinstall dist/aetherion-*.whl
 
 publish: build ## Upload dist/* to PyPI (requires UV_PUBLISH_TOKEN or ~/.pypirc)
 	uv publish
