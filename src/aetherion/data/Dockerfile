@@ -690,9 +690,11 @@ RUN rm -rf \
 # Both binaries ship from one PyPI distribution (`aetherion`); installing it
 # lands `conduit` (the in-container utility) and also drops the launcher
 # itself in `~/.local/bin` for symmetry. AETHERION_SPEC defaults to the
-# published wheel; the launcher overrides it to /tmp/aetherion-src when
-# invoked from a source checkout, so live edits under src/conduit/ end up
-# in the container without a publish.
+# unversioned `aetherion` (latest from PyPI) as a fallback when the build
+# is driven by hand (`podman build .`). The aetherion launcher always
+# overrides it: to /tmp/aetherion-src in dev-mode source-checkout runs, or
+# to a pinned `aetherion==<launcher-version>` otherwise — keeping the
+# in-container CLIs lockstep with whatever launcher kicked off the build.
 #
 # Position rationale: source overlays change often during development of
 # the launcher itself. Putting this layer first would invalidate every

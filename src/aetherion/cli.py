@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import os
 import secrets
 import shutil
@@ -556,10 +557,21 @@ def _build_image(image: str, context: Path, *, refresh_layers: bool = False) -> 
     # the launcher (or the user, via --build-dir) has staged a local source
     # tree there. Point the Dockerfile's `uv tool install` at it instead of
     # the default `aetherion` PyPI spec, so in-progress edits flow into the
-    # container without a publish.
+    # container without a publish. Otherwise pin the PyPI install to the
+    # launcher's own version: pyproject.toml is the single source of truth
+    # and importlib.metadata reads it back from the installed dist, so the
+    # in-container `aetherion`/`conduit` match the host launcher exactly
+    # instead of drifting to whatever's currently latest on PyPI.
     build_args: list[str] = []
     if (context / "aetherion-src" / "pyproject.toml").is_file():
         build_args = ["--build-arg", "AETHERION_SPEC=/tmp/aetherion-src"]
+    else:
+        launcher_version = _installed_version()
+        if launcher_version is not None:
+            build_args = [
+                "--build-arg",
+                f"AETHERION_SPEC=aetherion=={launcher_version}",
+            ]
 
     # --refresh-layers maps directly to the runtime's `--no-cache`. Same
     # flag name in podman and docker, so no per-runtime branching needed.
@@ -571,6 +583,19 @@ def _build_image(image: str, context: Path, *, refresh_layers: bool = False) -> 
     return subprocess.run(
         [CONTAINER_RUNTIME, "build", *cache_args, *build_args, "-t", image, str(context)],
     ).returncode
+
+
+def _installed_version() -> str | None:
+    """Return the launcher's own installed version (read from package
+    metadata, which is generated from pyproject.toml at build time — so
+    pyproject is the single source of truth shared by host launcher and
+    in-container install). Returns None only in environments where the
+    package isn't a real installed dist (rare; mostly direct-from-checkout
+    runs without an editable install)."""
+    try:
+        return importlib.metadata.version("aetherion")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _find_repo_root() -> Path | None:
