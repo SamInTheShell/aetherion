@@ -4,11 +4,12 @@ A containerized development environment for AI coding agents.
 
 Ships a Debian dev container preloaded with the bundled agent CLIs (Claude
 Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi,
-OpenClaw, Hermes), the Ollama client for running them against a local model
-daemon on the host, Neovim with LSP/DAP support, podman-in-podman, and
+OpenClaw, Hermes), Neovim with LSP/DAP support, podman-in-podman, and
 toolchains for Python, Node, Go, Rust, and Ruby. The `aetherion` launcher
 mounts the current directory at the same path inside the container and
-preserves per-agent login state across sessions.
+preserves per-agent login state across sessions. A second CLI, `conduit`,
+ships alongside and points the agents at a model server running on your
+host (Ollama, LM Studio, or any OpenAI-compatible endpoint).
 
 ## Install
 
@@ -31,27 +32,34 @@ aetherion --build-image    # one-time: build localhost/aetherion:dev
 aetherion                  # launch a shell in $PWD
 ```
 
-## Using local Ollama models
-
-The container ships the `ollama` client only — no server, no GPU runners.
-Point it at a daemon running on the host (or anywhere reachable) via
-`OLLAMA_HOST`. On Docker Desktop / podman-machine the host is reachable
-as `host.docker.internal`:
+Inside the container, point agents at your host's model server:
 
 ```shell
-OLLAMA_HOST=http://host.docker.internal:11434 ollama list
+conduit set endpoint lmstudio   # or `ollama`, or a full http(s):// URL
+conduit launch pi               # pick a model in the TUI; pi launches against it
 ```
 
-`ollama launch <agent>` writes the matching agent CLI's per-provider config
-so it routes through the daemon, then execs the agent for you. Tested:
+## Using a local model server
+
+The container itself does no inference — it's a dev environment. Run your
+model server on the host (LM Studio's local server, an `ollama serve` you
+already had, vLLM, llama.cpp's `llama-server`, anything that exposes
+OpenAI-compatible `/v1/models`) and `conduit` will wire the agent CLIs at
+it. The launcher sets up host-loopback networking automatically for both
+docker and rootless podman, so the host's `127.0.0.1:<port>` is reachable
+from inside the container without reconfiguring the model server.
 
 ```shell
-OLLAMA_HOST=http://host.docker.internal:11434 ollama launch pi
-OLLAMA_HOST=http://host.docker.internal:11434 ollama launch hermes
-OLLAMA_HOST=http://host.docker.internal:11434 ollama launch openclaw
-OLLAMA_HOST=http://host.docker.internal:11434 ollama launch codex
-OLLAMA_HOST=http://host.docker.internal:11434 ollama launch claude
+conduit set endpoint ollama                # → host's :11434
+conduit set endpoint lmstudio              # → host's :1234
+conduit set endpoint https://my.example    # any OpenAI-compatible /v1
+conduit launch pi                          # arrow-key model picker → pi
 ```
+
+Endpoint choice and last-used model per integration are stored at
+`~/.conduit/config.json` and preserved across container sessions.
+
+## Publishing in-container ports
 
 OpenClaw runs a gateway on port 18789 inside the container — but binds it
 to `127.0.0.1`, which podman/docker port forwarding can't reach. Use
@@ -70,25 +78,13 @@ port is always 18789 — openclaw's own). For ports that already bind
 0.0.0.0 inside the container, `--forward CONTAINER_PORT` (repeatable) is
 enough — no bridge needed.
 
-If you'd rather not retype the env var, set it on the host and pass it
-through with `--env`:
-
-```shell
-export OLLAMA_HOST=http://host.docker.internal:11434
-aetherion --env OLLAMA_HOST    # bare name inherits from host
-```
-
-The container ships real Node.js LTS, so ollama's preflight checks (which
-gate on `LookPath("npm")` and call `npm root -g` to find globally-installed
-agents) work natively. Bun is still installed as a fast user-scoped runtime;
-it just isn't pretending to be node.
-
 ## What's in the container
 
+- **Launcher tooling**: `conduit` (endpoint configuration + integration launcher; ships with aetherion)
 - **Languages & runtimes**: Python (system + uv), Node.js LTS + bun, Go, Rust, Ruby, C/C++ toolchain
 - **Agent CLIs**: Claude Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw, Hermes
 - **Editor**: Neovim with bundled LSPs (`pyright`, `gopls`, `rust-analyzer`, `lua-language-server`, `typescript-language-server`, `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`, `js-debug-adapter`)
-- **CLI tools**: git, podman, tmux, starship, ripgrep, fd, fzf, jq, yq, posting, openssh-client, ollama (client only — point at a host daemon via `OLLAMA_HOST`)
+- **CLI tools**: git, podman, tmux, starship, ripgrep, fd, fzf, jq, yq, posting, openssh-client
 
 ## State preservation
 
@@ -107,7 +103,8 @@ Subsequent launches bind-mount the saved config so you stay logged in.
 | `pi` | `.pi/` |
 | `openclaw` | `.openclaw/` |
 | `hermes` | `.hermes/` |
-| `npm` | `.npm-global/`, `.npm/` (user-scoped npm prefix + cache — preserves runtime-installed plugins like `@ollama/pi-web-search` and avoids re-fetching them when an agent reruns `npm update` on launch) |
+| `conduit` | `.conduit/` (endpoint choice + last-model-per-integration) |
+| `npm` | `.npm-global/`, `.npm/` (user-scoped npm prefix + cache — preserves runtime-installed agent plugins and avoids re-fetching when an agent reruns `npm update` on launch) |
 
 ## Flags
 
@@ -120,6 +117,7 @@ Subsequent launches bind-mount the saved config so you stay logged in.
 | `--image REF` | Image ref to run, and to tag when building. Default: `localhost/aetherion:dev`. |
 | `--build-image` | Build the image and exit. Does not launch the container. |
 | `--build-dir PATH` | Build context directory. Defaults to the Dockerfile bundled with the launcher. |
+| `--refresh-layers` | Discard the runtime's build cache for this build (`--no-cache`). Use to refresh anything pinned by an intermediate layer's snapshot: apt mirrors, the Node.js LTS tarball, the global npm install of agent CLIs, the cursor-agent installer, hermes-agent's PyPI release, neovim plugins. Without it you stay on whatever was current the first time the layer was built; with it every upstream gets re-fetched. Only meaningful with `--build-image`. |
 | `--extract PATH` | Copy the bundled Dockerfile, skeleton/, and scripts/ to PATH and exit. |
 
 `AETHERION_CONTAINER_RUNTIME=docker` overrides runtime auto-detection (podman is preferred when both are available).

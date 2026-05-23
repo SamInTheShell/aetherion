@@ -302,56 +302,6 @@ RUN apt-get update \
 #   -DGGML_HIPBLAS=ON
 # (And uncomment OPTIONAL [A] or [B] above first.)
 
-# ---------------------------------------------------------------------------
-# OPTIONAL [D-cpu]: Ollama (CPU-only)
-# ---------------------------------------------------------------------------
-# The simplest path — Ollama's official install script. CPU-only because
-# we're skipping CUDA/ROCm autodetect in the script. ~200MB.
-#
-# At runtime the launcher should expose port 11434 and a model volume:
-#   podman run -p 11434:11434 -v ollama-models:/home/aetherion/.ollama ...
-#
-# The install script tries to set up a systemd service that we don't want
-# (no systemd in container). OLLAMA_INSTALL_TYPE=binary skips that.
-#
-# RUN curl -fsSL https://ollama.com/install.sh \
-#         | OLLAMA_INSTALL_TYPE=binary sh \
-#  && ollama --version
-
-# ---------------------------------------------------------------------------
-# OPTIONAL [D-nvidia]: Ollama with NVIDIA CUDA backend
-# ---------------------------------------------------------------------------
-# Requires OPTIONAL [A] uncommented. The Ollama binary auto-detects CUDA
-# libraries at runtime if they're on LD_LIBRARY_PATH (which [A] sets).
-#
-# At runtime:
-#   podman run --device nvidia.com/gpu=all -p 11434:11434 \
-#              -v ollama-models:/home/aetherion/.ollama aetherion:latest \
-#              ollama serve
-#
-# RUN curl -fsSL https://ollama.com/install.sh \
-#         | OLLAMA_INSTALL_TYPE=binary sh \
-#  && ollama --version
-
-# ---------------------------------------------------------------------------
-# OPTIONAL [D-rocm]: Ollama with AMD ROCm backend
-# ---------------------------------------------------------------------------
-# Requires OPTIONAL [B] uncommented. Ollama's install script detects ROCm
-# from /opt/rocm and pulls the rocm-flavored binary automatically.
-#
-# At runtime:
-#   podman run --device /dev/kfd --device /dev/dri \
-#              --group-add video --group-add render \
-#              -p 11434:11434 -v ollama-models:/home/aetherion/.ollama \
-#              aetherion:latest ollama serve
-#
-# For unsupported AMD cards you may need HSA_OVERRIDE_GFX_VERSION at runtime.
-# Check `rocminfo` output for your gfx version.
-#
-# RUN curl -fsSL https://ollama.com/install.sh \
-#         | OLLAMA_INSTALL_TYPE=binary sh \
-#  && ollama --version
-
 # ===========================================================================
 # END OPTIONAL FEATURE BLOCKS
 # ===========================================================================
@@ -467,46 +417,6 @@ RUN set -eu; \
     # for a baked image where the system Python is ours to manage.
     pip3 install --break-system-packages --no-cache-dir --quiet debugpy; \
     python3 -c "import debugpy; print('debugpy', debugpy.__version__)"
-
-# ---------------------------------------------------------------------------
-# Stage 3e: install the ollama CLI binary only (no server runners)
-# We use `ollama` as a *client* — pointed at a daemon on the host via
-# OLLAMA_HOST (typically http://host.docker.internal:11434). The official
-# tarball ships ~1GB of runner libraries (CUDA/ROCm/CPU variants) under
-# lib/ollama that are only loaded by `ollama serve`. We extract just the
-# `bin/ollama` member from the zstd-compressed tar and drop everything else,
-# keeping the image lean. zstd + GNU tar's --zstd flag come from stage 3a.
-# Ref: https://github.com/ollama/ollama/releases
-# ---------------------------------------------------------------------------
-ARG OLLAMA_VERSION=latest
-RUN set -eu; \
-    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-        amd64) OLLAMA_ARCH=amd64 ;; \
-        arm64) OLLAMA_ARCH=arm64 ;; \
-        *) echo "unsupported arch: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
-    esac; \
-    if [ "${OLLAMA_VERSION}" = "latest" ]; then \
-        OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
-    else \
-        OLLAMA_URL="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.tar.zst"; \
-    fi; \
-    cd /tmp; \
-    # The ollama tarball is ~1.2 GiB and GitHub's release CDN occasionally
-    # 502s mid-fetch. Aggressive retry survives transient flakes; -C - lets
-    # an aborted download resume from where it stopped instead of starting
-    # from byte 0 on each attempt.
-    curl -fsSL \
-        --retry 8 \
-        --retry-delay 5 \
-        --retry-all-errors \
-        --retry-connrefused \
-        -C - \
-        -o ollama.tar.zst \
-        "${OLLAMA_URL}"; \
-    tar --zstd -xf ollama.tar.zst bin/ollama; \
-    install -m 0755 bin/ollama /usr/local/bin/ollama; \
-    rm -rf ollama.tar.zst bin/; \
-    ollama --version 2>/dev/null | head -1 || ollama help >/dev/null
 
 # ---------------------------------------------------------------------------
 # Stage 3f: install Node.js LTS from the upstream tarball
@@ -631,7 +541,8 @@ RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
 
 # bun (Oven) — installs to $BUN_INSTALL/bin (~/.bun/bin). Bun stays as a
 # fast user-scoped JS runtime + bundler; real node + npm live system-wide
-# (stage 3f/3g) and are what tools like `ollama launch …` find on PATH.
+# (stage 3f/3g) and are what npm-based agent CLIs (pi, openclaw, codex)
+# find on PATH.
 RUN curl -fsSL https://bun.sh/install | bash \
  && ${BUN_INSTALL}/bin/bun --version
 
@@ -772,6 +683,30 @@ RUN rm -rf \
         ~/.cache/go-build \
         ~/go/pkg \
         /tmp/* /var/tmp/* 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Stage 11: aetherion + conduit (parked at the end of the build deliberately)
+# ---------------------------------------------------------------------------
+# Both binaries ship from one PyPI distribution (`aetherion`); installing it
+# lands `conduit` (the in-container utility) and also drops the launcher
+# itself in `~/.local/bin` for symmetry. AETHERION_SPEC defaults to the
+# published wheel; the launcher overrides it to /tmp/aetherion-src when
+# invoked from a source checkout, so live edits under src/conduit/ end up
+# in the container without a publish.
+#
+# Position rationale: source overlays change often during development of
+# the launcher itself. Putting this layer first would invalidate every
+# downstream layer (nvim plugin sync, treesitter parser builds, skeleton
+# copy, cleanup) on each edit — typically minutes of wasted rebuild.
+# Parking it as the last RUN before CMD means a conduit edit only re-runs
+# the COPY + the (sub-second) `uv tool install`, and every heavyweight
+# stage stays cached.
+ARG AETHERION_SPEC=aetherion
+COPY --chown=${USERNAME}:${USERNAME} aetherion-src/ /tmp/aetherion-src/
+RUN uv tool install --python 3.13 "$AETHERION_SPEC" \
+ && conduit --help >/dev/null \
+ && aetherion --help >/dev/null \
+ && rm -rf /tmp/aetherion-src ~/.cache/uv/builds-v0 ~/.cache/uv/wheels-v*
 
 # ---------------------------------------------------------------------------
 # Runtime

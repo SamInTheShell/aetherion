@@ -4,14 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aetherion"
-version = "0.5.0"
+version = "0.6.0"
 description = "Dev container launcher for AI coding agents"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # conduit's hermes integration round-trips ~/.hermes/config.yaml, which
+    # means parsing existing user keys and re-emitting them verbatim. PyYAML
+    # is the only mature stdlib-shaped YAML library in the ecosystem; we
+    # keep it as the sole runtime dep on aetherion so the wheel install is
+    # one extra package, not a tree.
+    "pyyaml>=6.0",
+]
 
 [project.scripts]
 aetherion = "aetherion.cli:main"
+conduit = "conduit.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aetherion"]
+packages = ["src/aetherion", "src/conduit"]
