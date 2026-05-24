@@ -5,11 +5,17 @@ A containerized development environment for AI coding agents.
 Ships a Debian dev container preloaded with the bundled agent CLIs (Claude
 Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi,
 OpenClaw, Hermes), Neovim with LSP/DAP support, podman-in-podman, and
-toolchains for Python, Node, Go, Rust, and Ruby. The `aetherion` launcher
-mounts the current directory at the same path inside the container and
-preserves per-agent login state across sessions. A second CLI, `conduit`,
-ships alongside and points the agents at a model server running on your
-host (Ollama, LM Studio, or any OpenAI-compatible endpoint).
+toolchains for Python, Node, Go, Rust, and Ruby. Toolchains and agent
+binaries live system-wide in the image (under `/opt` and `/usr/local`),
+so image rebuilds deliver new versions to every workspace immediately.
+The `aetherion` launcher mounts the current directory inside the
+container and bind-mounts a host directory as `$HOME` — agent logins,
+shell history, and per-user tool state persist across sessions. Multiple
+independent **namespaces** (each its own `$HOME`) let you keep separate
+identities, model setups, or experiments side by side without cross-talk.
+A second CLI, `conduit`, ships alongside and points the agents at a
+model server running on your host (Ollama, LM Studio, or any
+OpenAI-compatible endpoint).
 
 ## Install
 
@@ -28,8 +34,8 @@ uv tool upgrade aetherion
 ## Quickstart
 
 ```shell
-aetherion --build-image    # one-time: build localhost/aetherion:dev
-aetherion                  # launch a shell in $PWD
+aetherion --build-image                  # one-time: build localhost/aetherion:dev
+aetherion                                # first run auto-creates the 'default' namespace and enters
 ```
 
 Inside the container, point agents at your host's model server:
@@ -80,46 +86,78 @@ enough — no bridge needed.
 
 ## What's in the container
 
+Everything below is installed system-wide (under `/usr/local/bin` and
+`/opt`), so it's shared across every namespace and tracks the image
+version automatically. Per-user state — agent logins, npm globals,
+runtime `go install` binaries, nvim plugins, shell history — lives in
+the namespace's `$HOME`.
+
 - **Launcher tooling**: `conduit` (endpoint configuration + integration launcher; ships with aetherion)
 - **Languages & runtimes**: Python (system + uv), Node.js LTS + bun, Go, Rust, Ruby, C/C++ toolchain
-- **Agent CLIs**: Claude Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw, Hermes
-- **Editor**: Neovim with bundled LSPs (`pyright`, `gopls`, `rust-analyzer`, `lua-language-server`, `typescript-language-server`, `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`, `js-debug-adapter`)
+- **Agent CLIs**: Claude Code, Cursor Agent (`agent`), GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw, Hermes
+- **Editor**: Neovim with bundled LSPs (`pyright`, `gopls`, `rust-analyzer`, `lua-language-server`, `typescript-language-server`, `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`, `js-debug-adapter`). Plugins (`Lazy.nvim`-managed) auto-install on first `nvim` launch in each namespace.
 - **CLI tools**: git, podman, tmux, starship, ripgrep, fd, fzf, jq, yq, posting, openssh-client
 
-## State preservation
+## Namespaces
 
-The first time you log in to a bundled agent CLI, the launcher detects the new
-config inside the container and copies it to `~/.aetherion/data/` on the host.
-Subsequent launches bind-mount the saved config so you stay logged in.
-`~/.aetherion/data/` is the only host directory the launcher writes to.
+A namespace is an independent host directory at
+`~/.aetherion/namespaces/<name>/` that the launcher bind-mounts as the
+container's `$HOME`. Everything that lives under `$HOME` inside the
+container — agent logins, runtime-installed npm/go/uv tools, nvim plugins
+once you've launched nvim, shell history, dotfile edits — is just files
+in that host directory and survives across sessions. Two namespaces
+share zero state: logging into Claude under `work` doesn't log you in
+under `play`.
 
-| agent | preserved paths |
-| --- | --- |
-| `claude` | `.claude/`, `.claude.json` |
-| `cursor` | `.cursor/`, `.config/cursor/` |
-| `copilot` | `.copilot/` |
-| `gemini` | `.gemini` |
-| `codex` | `.codex/` |
-| `pi` | `.pi/` |
-| `openclaw` | `.openclaw/` |
-| `hermes` | `.hermes/` |
-| `conduit` | `.conduit/` (endpoint choice + last-model-per-integration) |
-| `npm` | `.npm-global/`, `.npm/` (user-scoped npm prefix + cache — preserves runtime-installed agent plugins and avoids re-fetching when an agent reruns `npm update` on launch) |
-| `go` | `go/` (Go's GOPATH — `bin/` for user-installed Go tools plus `pkg/mod/` so the module cache survives between launches) |
+The first time a namespace is used, the launcher seeds it from the
+image's `/home/aetherion`. The seed is small — just the skeleton
+dotfiles (`.bashrc`, `.npmrc`, `.config/nvim/`, `.config/starship.toml`)
+— because system tools and agent binaries live outside `$HOME` in the
+image. First entry is near-instant; first `nvim` launch in a namespace
+then runs Lazy's plugin install (a few minutes; cached afterward) and
+treesitter parsers compile on first file open.
+
+```shell
+aetherion                                 # auto-creates 'default' on first use, then enters
+aetherion --namespace work --create-namespace
+aetherion -n work                         # next launches into 'work'
+aetherion --list-namespaces               # show what's been created and what image each came from
+aetherion --reset-namespace               # nuke 'default' and re-seed from current image
+aetherion -n work --reset-namespace --force
+```
+
+### What updates when, and what doesn't
+
+- **System tools (image-managed)**: `aetherion`, `conduit`, every agent CLI, every LSP/DAP, language runtimes. Rebuild the image and every existing namespace gets the new version on next launch — nothing to migrate.
+- **Namespace contents (your state)**: agent logins, `npm install -g` packages, `go install`-ed binaries, nvim plugins, shell history, anything you `touch`ed inside. Stays put across image upgrades. To reset, use `--reset-namespace`.
+- **Skeleton dotfiles (frozen at seed)**: `.bashrc`, `.npmrc`, `.config/nvim/`, `.config/starship.toml`. These are captured into the namespace at seed time and don't refresh when the image changes — if a new image ships a `.bashrc` you want, the launcher prints a one-line drift notice on launch suggesting `aetherion --reset-namespace` (which drops everything else in the namespace too, so use with care).
+
+### Migrating from older aetherion
+
+A prior install's `~/.aetherion/data/` (the per-agent layout) is
+auto-migrated into the `default` namespace on next launch: the launcher
+seeds `default` from the current image, overlays the legacy per-agent
+dirs (`.claude/`, `.gemini/`, `go/`, etc.) on top so existing logins win,
+and renames the old directory to `data.migrated-YYYYMMDD` as a safety
+net. Delete the safety copy once you've confirmed everything works.
 
 ## Flags
 
 | flag | purpose |
 | --- | --- |
-| `--agents LIST` | Comma-separated subset of agents to expose (default: all). `--agents ''` for none. |
+| `-n`, `--namespace NAME` | Namespace whose `$HOME` to mount. Default: `default` (auto-created on first use). Other namespaces error if they don't exist; pair with `--create-namespace`. Names: letters, digits, dot, underscore, dash (no leading dot). |
+| `--create-namespace` | Create the namespace selected by `-n` if it doesn't exist (seeded from the current image). No-op when it already exists. Not needed for `default`. Combines with launch. |
+| `--list-namespaces` | List existing namespaces with the image digest each was seeded from, then exit. |
+| `--reset-namespace` | Delete the namespace selected by `-n` and re-seed from the current image, then exit. Drops every in-namespace customization. Confirms unless `--force` is also passed. |
+| `--force` | Skip the confirmation prompt for `--reset-namespace`. |
 | `-e`, `--env NAME=VALUE` | Set a container environment variable. Repeatable. Quote at the shell for values with spaces: `--env 'NAME=has spaces'`. A bare `--env NAME` inherits from the host environment. |
 | `--forward [ADDR:[HOST_PORT:]]CONTAINER_PORT` | Publish a container port (podman/docker `-p` semantics). Repeatable. Forms: `PORT`, `HOST:CONTAINER`, `ADDR:HOST:CONTAINER`, `:HOST:CONTAINER`, `[::1]:HOST:CONTAINER`. Default host bind is `127.0.0.1`. Services that bind 127.0.0.1 inside the container won't be reachable through this alone — use a `--forward-<agent>` alias. |
 | `--forward-openclaw [ADDR][:PORT]` | Convenience alias for OpenClaw's gateway (container port 18789). Publishes the port AND sets up a loopback bridge so the publish actually reaches it (openclaw binds 127.0.0.1 inside the container). Bare = `127.0.0.1:18789`; otherwise accepts `ADDR`, `PORT`, `ADDR:PORT`, `:PORT`, `[::1]:PORT`. |
 | `--image REF` | Image ref to run, and to tag when building. Default: `localhost/aetherion:dev`. |
 | `--build-image` | Build the image and exit. Does not launch the container. |
 | `--build-dir PATH` | Build context directory. Defaults to the Dockerfile bundled with the launcher. |
-| `--refresh-layers` | Discard the runtime's build cache for this build (`--no-cache`). Use to refresh anything pinned by an intermediate layer's snapshot: apt mirrors, the Node.js LTS tarball, the global npm install of agent CLIs, the cursor-agent installer, hermes-agent's PyPI release, neovim plugins. Without it you stay on whatever was current the first time the layer was built; with it every upstream gets re-fetched. Only meaningful with `--build-image`. |
-| `--extract PATH` | Copy the bundled Dockerfile, skeleton/, and scripts/ to PATH and exit. |
+| `--refresh-layers` | Discard the runtime's build cache for this build (`--no-cache`). Use to refresh anything pinned by an intermediate layer's snapshot: apt mirrors, the Node.js LTS tarball, the system npm install of agent CLIs, the `cursor.com/install` script, hermes-agent's PyPI release, the gopls/dlv `go install`. Without it you stay on whatever was current the first time the layer was built; with it every upstream gets re-fetched. Only meaningful with `--build-image`. |
+| `--extract PATH` | Copy the bundled Dockerfile and skeleton/ to PATH and exit. |
 
 `AETHERION_CONTAINER_RUNTIME=docker` overrides runtime auto-detection (podman is preferred when both are available).
 

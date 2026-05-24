@@ -42,11 +42,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     # Disable apt recommends/suggests globally — smaller, more predictable images
     APT_LISTCHANGES_FRONTEND=none \
-    # uv: standardize cache + install paths
+    # uv: standardize copy semantics. UV_PYTHON_INSTALL_DIR and
+    # UV_TOOL_DIR are set per-invocation during the build (system paths)
+    # and again at the end as user paths for runtime — see stage 11+.
     UV_LINK_MODE=copy \
-    UV_PYTHON_INSTALL_DIR=/home/${USERNAME}/.local/share/uv/python \
-    # bun: keep installs under ~/.bun
-    BUN_INSTALL=/home/${USERNAME}/.bun \
     # Don't let Python buffer logs
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -522,107 +521,129 @@ COPY skeleton/etc/containers/ /etc/containers/
 COPY --chmod=0644 skeleton/etc/profile.d/aetherion-bridge.sh /etc/profile.d/aetherion-bridge.sh
 
 # ---------------------------------------------------------------------------
-# Stage 5: switch to non-root for all subsequent user-scoped tooling
+# Stage 5: skeleton dotfiles (root → /home/${USERNAME})
 # ---------------------------------------------------------------------------
-USER ${USERNAME}
-WORKDIR /home/${USERNAME}
-
-ENV HOME=/home/${USERNAME} \
-    PATH=/home/${USERNAME}/.local/bin:/home/${USERNAME}/.npm-global/bin:/home/${USERNAME}/.bun/bin:/usr/local/bin:/opt/node/bin:/usr/bin:/bin
+# Stays as root throughout the user-tool installs below — everything that
+# used to live under /home/${USERNAME} has been moved to system paths
+# (/usr/local/bin, /opt/*) so the image's $HOME contains only genuine
+# config that ships in skeleton/. This keeps the aetherion namespace seed
+# (which captures /home/aetherion verbatim at first launch) small and
+# avoids freezing toolchain versions into individual namespaces.
+#
+# Overlays on top of the /etc/skel files dropped by useradd; our .bashrc
+# wins, .profile is left alone so the standard login -> .bashrc chain works.
+COPY --chown=${USERNAME}:${USERNAME} skeleton/home/${USERNAME}/ /home/${USERNAME}/
 
 # ---------------------------------------------------------------------------
-# Stage 6: user-scoped tooling — uv (Python) and bun (JS/TS)
-# Both fetched from their upstream installers.
+# Stage 6: system-wide developer tooling
 # ---------------------------------------------------------------------------
+# Everything in this stage installs to /usr/local/bin or /opt — never under
+# /home/${USERNAME}. Rationale: the aetherion launcher bind-mounts a
+# per-namespace host dir at /home/aetherion, and on first launch it seeds
+# that dir by copying the image's $HOME out. Anything we baked under
+# $HOME would freeze into the seed and stop tracking image upgrades. By
+# keeping toolchains in /opt and /usr/local, image rebuilds deliver new
+# versions to every namespace immediately.
 
-# uv (Astral) — installs to ~/.local/bin
-RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
+# uv (Astral) — system binary at /usr/local/bin/uv. UV_INSTALL_DIR steers
+# the installer; UV_NO_MODIFY_PATH skips its bashrc-rewriting step (we
+# put /usr/local/bin on PATH ourselves anyway).
+RUN curl -fsSL https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
  && uv --version
 
-# bun (Oven) — installs to $BUN_INSTALL/bin (~/.bun/bin). Bun stays as a
-# fast user-scoped JS runtime + bundler; real node + npm live system-wide
-# (stage 3f/3g) and are what npm-based agent CLIs (pi, openclaw, codex)
-# find on PATH.
-RUN curl -fsSL https://bun.sh/install | bash \
- && ${BUN_INSTALL}/bin/bun --version
+# bun (Oven) — binary tree under /opt/bun, with a symlink at
+# /usr/local/bin/bun so it's discoverable without /opt/bun/bin on PATH.
+# Bun is the system JS runtime + bundler; real node + npm live system-wide
+# at /opt/node (stage 3f/3g) and are what npm-based agent CLIs (pi,
+# openclaw, codex) find on PATH.
+RUN curl -fsSL https://bun.sh/install \
+        | env BUN_INSTALL=/opt/bun bash \
+ && ln -sf /opt/bun/bin/bun /usr/local/bin/bun \
+ && bun --version
 
-# LSPs and vendor agent CLIs are installed system-wide in stage 3g via real
-# npm. They live in /opt/node/lib/node_modules with bin shims on PATH at
-# /opt/node/bin. The vim.lsp.config blocks in lsp-config.lua resolve these
-# by $PATH lookup.
-
-# Go-based LSP + DAP — install once at build so first-launch is offline-safe
-# and so we don't race Mason's `go install` against a root-owned module cache
-# (see syft caveat in stage 9). GOBIN lands these in ~/go/bin, on PATH below.
-ENV GOPATH=/home/${USERNAME}/go \
-    GOBIN=/home/${USERNAME}/go/bin \
-    PATH=/home/${USERNAME}/go/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.bun/bin:/usr/local/bin:/usr/bin:/bin
-RUN go install golang.org/x/tools/gopls@latest \
- && go install github.com/go-delve/delve/cmd/dlv@latest \
+# Go-based LSP + DAP (gopls, dlv). Built with a throwaway GOPATH so the
+# module cache (which sets parent dirs to 0555 — historically the source
+# of the launcher's seed-time chmod failures) never lands under any $HOME.
+# GOBIN places the compiled binaries directly in /usr/local/bin.
+RUN GOPATH=/tmp/gobuild GOBIN=/usr/local/bin \
+        go install golang.org/x/tools/gopls@latest \
+ && GOPATH=/tmp/gobuild GOBIN=/usr/local/bin \
+        go install github.com/go-delve/delve/cmd/dlv@latest \
  && gopls version \
- && dlv version
+ && dlv version \
+ && rm -rf /tmp/gobuild /root/.cache/go-build
 
 # posting (https://posting.sh) — a TUI HTTP client (Postman-in-the-terminal).
-# Installed as a uv tool, which creates an isolated venv under
-# ~/.local/share/uv/tools/posting and drops the launcher in ~/.local/bin.
-# Pin the Python interpreter so the image is reproducible regardless of
-# whatever default uv would pick at build time.
-RUN uv tool install --python 3.13 posting \
+# Installed as a uv tool to /opt/uv-tools, with the launcher shim landing
+# in /usr/local/bin. UV_PYTHON_INSTALL_DIR steers the downloaded Python
+# 3.13 interpreter into /opt/uv-pythons so it lives system-wide alongside
+# the venv (every uv tool below shares the same interpreter pool).
+RUN UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
+        uv tool install --python 3.13 posting \
  && posting --help >/dev/null
 
-# Hermes Agent (https://github.com/NousResearch/hermes-agent) — Nous Research's
-# self-improving CLI agent. Distributed as the `hermes-agent` PyPI package with
-# a `hermes` entry point; same uv-tool shape as posting above, so it lands at
-# ~/.local/share/uv/tools/hermes-agent with the launcher in ~/.local/bin.
-# Hermes requires Python >=3.11; 3.13 is fine and lets us reuse posting's
-# interpreter. Config/state lives in ~/.hermes (HERMES_HOME) — the launcher's
-# AGENT_PATHS entry preserves that across sessions.
-RUN uv tool install --python 3.13 hermes-agent \
+# Hermes Agent (https://github.com/NousResearch/hermes-agent) — Nous
+# Research's self-improving CLI agent, distributed as the `hermes-agent`
+# PyPI package with a `hermes` entry point. Same uv-tool shape as posting
+# above; reuses the /opt/uv-pythons Python 3.13. Config/state lives in
+# ~/.hermes (HERMES_HOME) inside the user's namespace, persisted by the
+# namespace mount.
+RUN UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
+        uv tool install --python 3.13 hermes-agent \
  && hermes --help >/dev/null
 
-# Cursor Agent (`cursor-agent`) — vendor agent CLI from Cursor. Distributed
-# as a prebuilt binary via an upstream install script; lands in
-# ~/.local/bin/cursor-agent (already on PATH). Trust here is TLS to
-# cursor.com plus whatever signing the installer enforces internally.
+# Cursor Agent — vendor agent CLI from Cursor. Installer hardcodes
+# ~/.local/bin (relative to $HOME). We point HOME at a system directory
+# (/opt/cursor-agent-home) so the install lands there permanently;
+# symlinks into /usr/local/bin put it on PATH for any user. Self-update
+# would write back into the same system directory; users can't
+# self-update without sudo, which is the right default for a baked
+# system tool. Trust: TLS to cursor.com plus whatever signing the
+# installer enforces internally.
+#
+# Cursor renamed the binary from `cursor-agent` → `agent` somewhere in
+# late 2025/early 2026. We sniff for whichever name the installer
+# dropped under .local/bin and expose it under BOTH names from
+# /usr/local/bin: `agent` (the current canonical) and `cursor-agent`
+# (the historical name, kept so any scripts/muscle memory still work).
+# Errors out only if NEITHER name was installed.
 # Ref: https://docs.cursor.com/en/cli/overview
-RUN curl -fsSL https://cursor.com/install | bash \
- && command -v cursor-agent
+RUN install -d /opt/cursor-agent-home \
+ && curl -fsSL https://cursor.com/install \
+        | env HOME=/opt/cursor-agent-home bash \
+ && ls /opt/cursor-agent-home/.local/bin/ \
+ && BIN= \
+ && for name in agent cursor-agent; do \
+        if [ -e "/opt/cursor-agent-home/.local/bin/$name" ]; then \
+            BIN="/opt/cursor-agent-home/.local/bin/$name"; \
+            break; \
+        fi; \
+    done \
+ && if [ -z "$BIN" ]; then \
+        echo "cursor installer produced neither 'agent' nor 'cursor-agent'" >&2; \
+        exit 1; \
+    fi \
+ && ln -sf "$BIN" /usr/local/bin/agent \
+ && ln -sf "$BIN" /usr/local/bin/cursor-agent \
+ && agent --version
 
 # ---------------------------------------------------------------------------
-# Stage 7: bring in user-owned dotfiles (.bashrc, nvim config, starship, etc.)
-# System-level skeleton entries (/etc/...) are copied earlier as root-owned.
-# This overlays on top of the /etc/skel files dropped by useradd; our .bashrc
-# wins, .profile is left alone so the standard login -> .bashrc chain works.
+# Stage 7: nvim plugins + treesitter parsers — deferred to first launch
 # ---------------------------------------------------------------------------
-USER root
-COPY --chown=${USERNAME}:${USERNAME} skeleton/home/${USERNAME}/ /home/${USERNAME}/
-USER ${USERNAME}
-
-# ---------------------------------------------------------------------------
-# Stage 8: bootstrap Neovim plugins + treesitter parsers headlessly.
-#
-# Mason is intentionally *not* used here — we proved it racy in headless mode
-# (orphaned lockfiles, async installs that don't survive `+qa`, UI calls into
-# `:!clear` that trip on missing TERM). All LSP/DAP binaries are baked in
-# system-wide by stage 3d above. mason-lspconfig and mason-nvim-dap are still
-# present as plugins for ad-hoc :Mason use later, but their ensure_installed
-# lists are empty in the user's nvim config so nothing auto-installs at
-# startup.
-#
-# Treesitter parsers still need to be compiled. We use a tiny Lua helper that
-# wipes any partial .so files from earlier nvim invocations and synchronously
-# installs the full set — sidestepping :TSInstallSync's interactive
-# "reinstall ? y/n" prompt that hangs in headless mode.
-#
-# --chown so aetherion can rm the file afterwards (sticky-bit /tmp blocks
-# non-owner deletion when COPY defaults the file to root).
-# TERM=dumb prevents :!clear shell errors from tripping `set -e`.
-# ---------------------------------------------------------------------------
-COPY --chown=${USERNAME}:${USERNAME} scripts/install-treesitter.lua /tmp/install-treesitter.lua
-RUN set -e; \
-    TERM=dumb nvim --headless "+Lazy! sync" +qa || true; \
-    TERM=dumb nvim --headless -c "luafile /tmp/install-treesitter.lua"; \
-    rm -f /tmp/install-treesitter.lua
+# Used to bootstrap Lazy.nvim + treesitter headlessly at build, baking
+# ~1GB of plugin state into the image's $HOME. That bloated every
+# namespace seed even for users who never opened nvim, AND the plugins
+# froze at the version the image happened to ship. Now: nothing happens
+# here. On first `nvim` invocation inside a namespace, init.lua's
+# bootstrap clones Lazy.nvim, Lazy auto-installs plugins, and treesitter
+# parsers compile on first file open (the C toolchain from stage 3 is
+# present). Cost: a few minutes of one-time setup per namespace that
+# actually uses nvim. Benefit: zero footprint for users who don't.
 
 ## ---------------------------------------------------------------------------
 ## Stage 9: generate embedded SBOM at /etc/sbom.spdx.json
@@ -670,49 +691,84 @@ RUN set -e; \
 #USER ${USERNAME}
 
 # ---------------------------------------------------------------------------
-# Stage 10: final cleanup of user-scoped caches
+# Stage 10: final cleanup of root-side caches
 # ---------------------------------------------------------------------------
-# Go's build + module caches are large (hundreds of MB of source) and only
-# needed during `go install`. The compiled gopls/dlv binaries live in
-# ~/go/bin and survive this prune.
+# Build-time caches under /root (the build runs as root throughout). uv's
+# wheels/builds cache balloons during the tool installs above; clean
+# unconditionally. /tmp is wiped to drop the throwaway gobuild dir and
+# anything else stages above left behind.
 RUN rm -rf \
-        ~/.cache/pip \
-        ~/.cache/uv/builds-v0 \
-        ~/.cache/uv/wheels-v* \
-        ~/.bun/install/cache \
-        ~/.cache/go-build \
-        ~/go/pkg \
+        /root/.cache/pip \
+        /root/.cache/uv \
+        /root/.cache/go-build \
         /tmp/* /var/tmp/* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Stage 11: aetherion + conduit (parked at the end of the build deliberately)
 # ---------------------------------------------------------------------------
-# Both binaries ship from one PyPI distribution (`aetherion`); installing it
-# lands `conduit` (the in-container utility) and also drops the launcher
-# itself in `~/.local/bin` for symmetry. AETHERION_SPEC defaults to the
-# unversioned `aetherion` (latest from PyPI) as a fallback when the build
-# is driven by hand (`podman build .`). The aetherion launcher always
-# overrides it: to /tmp/aetherion-src in dev-mode source-checkout runs, or
-# to a pinned `aetherion==<launcher-version>` otherwise — keeping the
-# in-container CLIs lockstep with whatever launcher kicked off the build.
+# Both binaries ship from one PyPI distribution (`aetherion`); installing
+# it lands `conduit` (the in-container utility) and also drops the
+# launcher itself in /usr/local/bin for symmetry. AETHERION_SPEC defaults
+# to the unversioned `aetherion` (latest from PyPI) as a fallback when
+# the build is driven by hand (`podman build .`). The aetherion launcher
+# always overrides it: to /tmp/aetherion-src in dev-mode source-checkout
+# runs, or to a pinned `aetherion==<launcher-version>` otherwise —
+# keeping the in-container CLIs lockstep with whatever launcher kicked
+# off the build.
+#
+# Installed system-wide under /opt/uv-tools with shims in /usr/local/bin
+# (same shape as posting/hermes above), so the namespace seed doesn't
+# freeze the version. Image rebuilds deliver fresh aetherion/conduit to
+# every existing namespace immediately.
 #
 # Position rationale: source overlays change often during development of
 # the launcher itself. Putting this layer first would invalidate every
-# downstream layer (nvim plugin sync, treesitter parser builds, skeleton
-# copy, cleanup) on each edit — typically minutes of wasted rebuild.
-# Parking it as the last RUN before CMD means a conduit edit only re-runs
+# downstream layer (skeleton copy, system tool installs, cleanup) on
+# each edit — typically minutes of wasted rebuild. Parking it as the
+# last RUN before the runtime stanza means a conduit edit only re-runs
 # the COPY + the (sub-second) `uv tool install`, and every heavyweight
 # stage stays cached.
 ARG AETHERION_SPEC=aetherion
-COPY --chown=${USERNAME}:${USERNAME} aetherion-src/ /tmp/aetherion-src/
-RUN uv tool install --python 3.13 "$AETHERION_SPEC" \
+COPY aetherion-src/ /tmp/aetherion-src/
+RUN UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
+        uv tool install --python 3.13 "$AETHERION_SPEC" \
  && conduit --help >/dev/null \
  && aetherion --help >/dev/null \
- && rm -rf /tmp/aetherion-src ~/.cache/uv/builds-v0 ~/.cache/uv/wheels-v*
+ && rm -rf /tmp/aetherion-src /root/.cache/uv
 
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
+# Switch to the non-root user, set runtime env (HOME and per-tool dirs
+# that should land inside the user's namespace mount), and drop into an
+# interactive login shell. The CLI launcher overrides CMD as needed.
+#
+# Per-tool env that should live in the namespace:
+#   GOPATH/GOBIN  — runtime `go install` lands binaries in ~/go/bin;
+#                   module downloads land in ~/go/pkg/mod.
+#   BUN_INSTALL   — runtime `bun install -g <pkg>` puts globals under
+#                   ~/.bun (the bun binary itself is system-wide at
+#                   /usr/local/bin/bun via the symlink above).
+#   UV_PYTHON_INSTALL_DIR — runtime `uv` downloads Python interpreters
+#                   into ~/.local/share/uv/python so user-installed
+#                   tools don't try to write to /opt/uv-pythons (which
+#                   is image-baked and root-owned).
+#
+# PATH puts user-scoped install dirs first so anything the user installs
+# at runtime takes precedence over the baked-in system versions if they
+# choose to override (e.g. `uv tool install -U aetherion`).
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
+ENV HOME=/home/${USERNAME} \
+    GOPATH=/home/${USERNAME}/go \
+    GOBIN=/home/${USERNAME}/go/bin \
+    BUN_INSTALL=/home/${USERNAME}/.bun \
+    UV_PYTHON_INSTALL_DIR=/home/${USERNAME}/.local/share/uv/python \
+    PATH=/home/${USERNAME}/go/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.npm-global/bin:/home/${USERNAME}/.bun/bin:/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # Default to an interactive login shell; the CLI launcher overrides as needed.
 # (No trailing `SHELL` directive — there are no RUN steps after this point for
 # it to influence, and OCI image format ignores it with a build-time warning.)

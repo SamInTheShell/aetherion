@@ -1,9 +1,10 @@
 """Persistent settings for the conduit CLI.
 
-Settings live at ``~/.conduit/config.json``. The directory is mirrored to
-``~/.aetherion/data/.conduit`` on the host by the aetherion launcher (see
-``AGENT_PATHS`` in ``src/aetherion/cli.py``) so endpoint choice and last
-model survive between container sessions.
+Settings live at ``~/.conduit/config.json``. Inside the aetherion
+container, ``$HOME`` is a bind mount of the active namespace directory on
+the host (``~/.aetherion/namespaces/<name>/``), so endpoint choice and
+last-used model survive between sessions automatically — no per-path
+mirroring needed.
 """
 from __future__ import annotations
 

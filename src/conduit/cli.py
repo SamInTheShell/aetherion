@@ -5,8 +5,9 @@ OpenAI-compatible model server (Ollama, LM Studio, vLLM, ...).
 Settings live at ``~/.conduit/config.json``; ``conduit set endpoint`` picks
 the server, ``conduit launch <integration>`` rewrites the integration's
 config to use it and execs the binary. Inside the aetherion container,
-``~/.conduit/`` is mirrored back to the host at ``~/.aetherion/data/.conduit``
-so the choice persists across sessions.
+``$HOME`` (including ``~/.conduit/``) is the bind-mounted namespace
+directory on the host (``~/.aetherion/namespaces/<name>/``), so endpoint
+choice and last-used model survive across sessions automatically.
 """
 from __future__ import annotations
 

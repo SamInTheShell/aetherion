@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import errno
 import importlib.metadata
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -52,42 +54,34 @@ def _bridge_port_for(service_port: int) -> int:
 BUNDLED_ASSETS: tuple[str, ...] = (
     "Dockerfile",
     "skeleton",
-    "scripts",
     "aetherion-src",
 )
 
-# Per-agent state we preserve on the host so that login or first-run setup
-# done inside one container session survives into the next. Each tuple lists
-# the paths (relative to CONTAINER_HOME, mirrored under the host data dir)
-# owned by that agent — keep new paths grouped under the agent that owns
-# them so `--agents <name>` slicing keeps working with no extra plumbing.
-AGENT_PATHS: dict[str, tuple[str, ...]] = {
-    "claude":   (".claude", ".claude.json"),
-    "cursor":   (".cursor", ".config/cursor"),
-    "copilot":  (".copilot",),
-    "gemini":   (".gemini",),
-    "codex":    (".codex",),
-    "pi":       (".pi",),
-    "openclaw": (".openclaw",),
-    "hermes":   (".hermes",),
-    # Not an agent itself — conduit's settings (endpoint choice + last-used
-    # model per integration). Preserving the dir lets `conduit set endpoint`
-    # in one session take effect in the next without re-running it.
-    "conduit":  (".conduit",),
-    # Not an agent in its own right — this is the user-scoped npm prefix
-    # (~/.npmrc redirects `npm install -g` here) plus npm's tarball/metadata
-    # cache. Agents that install plugins at runtime land their packages
-    # under .npm-global; the cache at .npm/_cacache means subsequent
-    # `npm update <pkg>` calls serve from disk instead of re-fetching.
-    "npm":      (".npm-global", ".npm"),
-    # Not an agent in its own right — this is Go's GOPATH (the Dockerfile
-    # pins it to ~/go). Holds compiled binaries under bin/ (gopls + dlv from
-    # the image build, plus anything the user `go install`s at runtime) and
-    # the module cache under pkg/mod. Preserving the whole tree keeps
-    # user-installed Go tools across sessions and avoids re-downloading
-    # modules every container launch.
-    "go":       ("go",),
-}
+# Namespace layout: the entire container $HOME is bind-mounted from one
+# host directory per namespace under ~/.aetherion/namespaces/<name>/. The
+# first time a namespace is used we seed it by `<runtime> cp`-ing
+# /home/aetherion out of the image; subsequent launches reuse the saved
+# tree as-is. There is no per-path tracking and no exit-time extraction.
+# Multiple namespaces are independent — each is a complete $HOME snapshot,
+# so an agent logged in under one namespace is not logged in under another.
+NAMESPACES_DIRNAME = "namespaces"
+DEFAULT_NAMESPACE = "default"
+LEGACY_DATA_DIRNAME = "data"
+# Lives inside each namespace dir. Stores the content-digest ID of the
+# image the namespace was seeded from, so we can warn on drift when the
+# launcher / image is upgraded but the namespace is still pinned to the
+# prior baseline.
+IMAGE_ID_STAMP = ".aetherion/image-id"
+
+# Anything other than letters, digits, dot, underscore, dash trips a path
+# traversal or shell-surprise risk (`..`, `/`, leading `-`, whitespace).
+# Leading dot is rejected on top of that so the namespace dir doesn't
+# pretend to be a dotfile under ~/.aetherion/namespaces/.
+_NAMESPACE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
+
+def _is_valid_namespace_name(name: str) -> bool:
+    return bool(_NAMESPACE_NAME_RE.fullmatch(name))
 
 
 def _detect_runtime() -> str:
@@ -163,32 +157,31 @@ def host_internal_args() -> list[str]:
 
 
 def _bundled_assets_dir() -> Path:
-    # Dockerfile + skeleton/ + scripts/ ship inside the package itself, in a
-    # sibling data/ directory. This resolves to the same real path whether
-    # the launcher runs from a source checkout, an editable install, or a
+    # Dockerfile + skeleton/ ship inside the package itself, in a sibling
+    # data/ directory. This resolves to the same real path whether the
+    # launcher runs from a source checkout, an editable install, or a
     # pip-installed wheel — no importlib.resources dance required, because
     # we always need real filesystem paths anyway (docker build + shutil
     # both want them).
     return Path(__file__).resolve().parent / "data"
 
 
+def _namespaces_dir(home: Path) -> Path:
+    return home / ".aetherion" / NAMESPACES_DIRNAME
+
+
+def _namespace_dir(home: Path, name: str) -> Path:
+    return _namespaces_dir(home) / name
+
+
+def _legacy_data_dir(home: Path) -> Path:
+    return home / ".aetherion" / LEGACY_DATA_DIRNAME
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="aetherion",
         description="Launch the aetherion dev container.",
-    )
-    known = ", ".join(AGENT_PATHS)
-    parser.add_argument(
-        "--agents",
-        metavar="LIST",
-        type=lambda s: [a.strip() for a in s.split(",") if a.strip()],
-        default=list(AGENT_PATHS),
-        help=(
-            "Comma-separated subset of agent toolchains whose login/setup state "
-            "to expose into the container. Anything not listed is neither "
-            f"mounted in nor preserved on exit. Default: all. Known: {known}. "
-            "Pass an empty value (--agents '') to expose nothing."
-        ),
     )
     parser.add_argument(
         "--image",
@@ -231,10 +224,64 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         default=None,
         help=(
-            "Copy the bundled Dockerfile, skeleton/, and scripts/ into PATH "
-            "and exit without launching. Use this to customize the image: "
-            "edit, then `aetherion --build-image --build-dir PATH`."
+            "Copy the bundled Dockerfile and skeleton/ into PATH and exit "
+            "without launching. Use this to customize the image: edit, "
+            "then `aetherion --build-image --build-dir PATH`."
         ),
+    )
+    parser.add_argument(
+        "-n", "--namespace",
+        metavar="NAME",
+        default=None,
+        help=(
+            f"Namespace whose $HOME to mount into the container. Each "
+            f"namespace is an independent directory at "
+            f"~/.aetherion/{NAMESPACES_DIRNAME}/<name>/ — agent logins, "
+            f"installed tools, and shell history under one namespace are "
+            f"invisible to another. Default: {DEFAULT_NAMESPACE!r}, which "
+            f"is auto-created on first use. Other namespaces error if "
+            f"they don't exist; pass --create-namespace to create one on "
+            f"the fly. Names: letters, digits, dot, underscore, dash (no "
+            f"leading dot)."
+        ),
+    )
+    parser.add_argument(
+        "--create-namespace",
+        action="store_true",
+        help=(
+            "Create the namespace selected by --namespace if it does not "
+            "exist (seeded from the current image's /home/aetherion). "
+            "No-op when the namespace already exists. Not required for "
+            f"the {DEFAULT_NAMESPACE!r} namespace — that one auto-creates."
+        ),
+    )
+    parser.add_argument(
+        "--list-namespaces",
+        action="store_true",
+        help=(
+            "List existing namespaces under ~/.aetherion/"
+            f"{NAMESPACES_DIRNAME}/ with the image digest each was seeded "
+            "from, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--reset-namespace",
+        action="store_true",
+        help=(
+            "Delete the namespace selected by --namespace and re-seed it "
+            "from the current image, then exit. Drops every in-container "
+            "customization in that namespace (agent logins, npm globals, "
+            "go binaries, nvim plugin updates, shell history, etc.) — use "
+            "this when you want the image's current defaults instead of "
+            "whatever was baked in at the time the namespace was first "
+            "populated. Prompts for confirmation unless --force is also "
+            "passed."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the confirmation prompt for --reset-namespace.",
     )
     parser.add_argument(
         "-e", "--env",
@@ -361,18 +408,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.extract is not None:
         return _extract_bundle(Path(args.extract).expanduser().resolve())
 
-    unknown = [a for a in args.agents if a not in AGENT_PATHS]
-    if unknown:
-        sys.stderr.write(
-            f"aetherion: unknown agent(s): {', '.join(unknown)}\n"
-            f"aetherion: known agents: {', '.join(AGENT_PATHS)}\n"
-        )
-        return 2
-
-    selected: list[str] = args.agents
-    if set(selected) != set(AGENT_PATHS):
-        scope = ", ".join(selected) if selected else "(none)"
-        sys.stderr.write(f"aetherion: agent scope limited to: {scope}\n")
+    # --list-namespaces is terminal: just reads the host filesystem, no
+    # image / runtime needed.
+    if args.list_namespaces:
+        return _list_namespaces(Path.home())
 
     image: str = args.image
 
@@ -407,132 +446,145 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     home = Path.home()
-    pwd = Path.cwd()
+    # args.namespace is None when -n/--namespace wasn't passed; fall back
+    # to the default. Explicit `-n ''` would fail the validity check
+    # below (not the silent fall-through `or` operator gives), preserving
+    # the "garbage in, error out" rule.
+    namespace: str = args.namespace if args.namespace is not None else DEFAULT_NAMESPACE
+    if not _is_valid_namespace_name(namespace):
+        sys.stderr.write(
+            f"aetherion: invalid namespace name {namespace!r}. "
+            "Names: letters, digits, dot, underscore, dash; no leading dot.\n"
+        )
+        return 2
+    ns_dir = _namespace_dir(home, namespace)
 
-    data_dir = home / ".aetherion" / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # --reset-namespace is terminal: nukes the namespace, re-seeds, exits.
+    if args.reset_namespace:
+        return _reset_namespace(image, ns_dir, namespace=namespace, force=args.force)
+
+    # Legacy data is namespace-less, so it folds into 'default' specifically.
+    # The check runs regardless of which namespace was selected on this
+    # invocation — if you migrate from a legacy install but launch into a
+    # fresh new namespace, your old state still lands somewhere
+    # discoverable instead of being orphaned indefinitely.
+    rc = _migrate_legacy_data(image, home)
+    if rc != 0:
+        return rc
+
+    if not ns_dir.exists():
+        # The default namespace auto-creates whenever it's the selected
+        # one — whether `aetherion` was run with no -n at all (the common
+        # case) or with `-n default` explicitly. Non-default namespaces
+        # require --create-namespace to opt in, which keeps a typo in
+        # `-n produciton` from silently spawning a new namespace and
+        # losing the user's actual state.
+        if namespace == DEFAULT_NAMESPACE or args.create_namespace:
+            rc = _seed_namespace(image, ns_dir)
+            if rc != 0:
+                return rc
+        else:
+            sys.stderr.write(
+                f"aetherion: namespace {namespace!r} does not exist at {ns_dir}.\n"
+                f"aetherion: pass --create-namespace to create it (seeded from "
+                f"{image}), or `aetherion --list-namespaces` to see what's "
+                f"available.\n"
+            )
+            return 1
+    else:
+        if args.create_namespace:
+            # Explicit no-op acknowledgement so it's not silent — useful when
+            # this lives in a script that always passes --create-namespace
+            # idempotently.
+            sys.stderr.write(
+                f"aetherion: namespace {namespace!r} already exists; "
+                "--create-namespace had nothing to do.\n"
+            )
+        _warn_on_image_drift(image, ns_dir)
+
+    pwd = Path.cwd()
 
     # Rewrite host home → container home so a host path of ~/foo lands at ~/foo
     # inside the container too. Anything outside $HOME is mounted at its real
     # path, since there's no portable home-relative form for it.
     if pwd == home:
+        # The namespace mount already covers /home/aetherion. Adding a
+        # second -v for the host home at the same target would either error
+        # or silently shadow the namespace (defeating the whole feature),
+        # so we skip the workdir bind and let the user land in the
+        # namespace's $HOME. Behavior change vs the old layout: running
+        # `aetherion` from your host $HOME no longer exposes host $HOME to
+        # the container; cd into a subdirectory (or pass an explicit -v) if
+        # you want that.
         container_workdir = CONTAINER_HOME
+        workdir_mount: list[str] = []
     elif home in pwd.parents:
         container_workdir = f"{CONTAINER_HOME}/{pwd.relative_to(home)}"
+        workdir_mount = ["-v", f"{pwd}:{container_workdir}:z"]
     else:
         container_workdir = str(pwd)
+        workdir_mount = ["-v", f"{pwd}:{container_workdir}:z"]
 
-    mounts: list[str] = []
-    # (agent, rel) for each deferred path so the first-run notice and the
-    # post-exit "preserved <agent>" log can name the agent that owns it.
-    deferred: list[tuple[str, str]] = []
-
-    for agent in selected:
-        for rel in AGENT_PATHS[agent]:
-            host_path = data_dir / rel
-            container_path = f"{CONTAINER_HOME}/{rel}"
-            if host_path.exists():
-                mounts += ["-v", f"{host_path}:{container_path}:z"]
-            else:
-                deferred.append((agent, rel))
-
-    if deferred:
-        sys.stderr.write(
-            "aetherion: these agent paths are not yet preserved on the host;\n"
-            "any that get created during the session will be extracted on clean exit:\n"
-        )
-        last_agent: str | None = None
-        for agent, rel in deferred:
-            if agent != last_agent:
-                sys.stderr.write(f"  [{agent}]\n")
-                last_agent = agent
-            sys.stderr.write(f"    - {data_dir / rel}\n")
-        sys.stderr.write("aetherion: let the container exit cleanly, do not SIGKILL the launcher.\n\n")
-
-    # --cidfile instead of --rm: we need the container to outlive the shell so
-    # we can diff and `cp` config out before removing it.
     instance_id = secrets.token_hex(4)
     instance_name = f"aetherion-{instance_id}"
 
-    with tempfile.TemporaryDirectory(prefix="aetherion-cid-") as td:
-        cidfile = Path(td) / "cid"
+    # Passed through subprocess as separate argv entries, so values with
+    # spaces or shell-special characters are safe — no shell evaluation.
+    env_args: list[str] = []
+    for kv in args.env:
+        env_args += ["-e", kv]
 
-        # Passed through subprocess as separate argv entries, so values with
-        # spaces or shell-special characters are safe — no shell evaluation.
-        env_args: list[str] = []
-        for kv in args.env:
-            env_args += ["-e", kv]
-
-        # Port publishing. `--forward` is the generic flag (podman/docker
-        # `-p` semantics); `--forward-<agent>` flags are convenience aliases
-        # that also enroll the container port in AETHERION_BRIDGE_PORTS so
-        # /etc/profile.d/aetherion-bridge.sh stands up a loopback bridge —
-        # required for services that hardcode 127.0.0.1 as their bind, since
-        # `-p` forwarding terminates at the container's external interface.
-        publish_args: list[str] = []
-        # Each pair is (service_port, bridge_port). socat inside the container
-        # listens on bridge_port and forwards to 127.0.0.1:service_port.
-        bridge_pairs: list[tuple[int, int]] = []
-        try:
-            for raw in args.forward:
-                publish_args += ["-p", _parse_forward_spec(raw)]
-            if args.forward_openclaw is not None:
-                bp = _bridge_port_for(OPENCLAW_GATEWAY_PORT)
-                publish_args += [
-                    "-p",
-                    _build_alias_publish_spec(args.forward_openclaw, OPENCLAW_GATEWAY_PORT, bp),
-                ]
-                bridge_pairs.append((OPENCLAW_GATEWAY_PORT, bp))
-        except ValueError as e:
-            sys.stderr.write(f"aetherion: {e}\n")
-            return 2
-
-        if bridge_pairs:
-            env_args += [
-                "-e",
-                f"AETHERION_BRIDGE_PORTS={','.join(f'{s}:{b}' for s, b in bridge_pairs)}",
+    # Port publishing. `--forward` is the generic flag (podman/docker
+    # `-p` semantics); `--forward-<agent>` flags are convenience aliases
+    # that also enroll the container port in AETHERION_BRIDGE_PORTS so
+    # /etc/profile.d/aetherion-bridge.sh stands up a loopback bridge —
+    # required for services that hardcode 127.0.0.1 as their bind, since
+    # `-p` forwarding terminates at the container's external interface.
+    publish_args: list[str] = []
+    # Each pair is (service_port, bridge_port). socat inside the container
+    # listens on bridge_port and forwards to 127.0.0.1:service_port.
+    bridge_pairs: list[tuple[int, int]] = []
+    try:
+        for raw in args.forward:
+            publish_args += ["-p", _parse_forward_spec(raw)]
+        if args.forward_openclaw is not None:
+            bp = _bridge_port_for(OPENCLAW_GATEWAY_PORT)
+            publish_args += [
+                "-p",
+                _build_alias_publish_spec(args.forward_openclaw, OPENCLAW_GATEWAY_PORT, bp),
             ]
+            bridge_pairs.append((OPENCLAW_GATEWAY_PORT, bp))
+    except ValueError as e:
+        sys.stderr.write(f"aetherion: {e}\n")
+        return 2
 
-        run_argv = [
-            CONTAINER_RUNTIME, "run",
-            *user_ns_args(),
-            *network_args(),
-            "--name", instance_name,
-            "--hostname", instance_id,
-            "--cidfile", str(cidfile),
-            *host_internal_args(),
-            *env_args,
-            *publish_args,
-            "-v", f"{pwd}:{container_workdir}:z",
-            "-w", container_workdir,
-            *mounts,
-            "-it",
-            image,
+    if bridge_pairs:
+        env_args += [
+            "-e",
+            f"AETHERION_BRIDGE_PORTS={','.join(f'{s}:{b}' for s, b in bridge_pairs)}",
         ]
 
-        rc = subprocess.run(run_argv).returncode
+    # The namespace mount lands first so the workdir mount (when present, and
+    # always a subpath of CONTAINER_HOME for host paths under $HOME) layers
+    # on top of it cleanly — both runtimes process binds in declaration
+    # order and the deeper-path mount wins for its subtree.
+    run_argv = [
+        CONTAINER_RUNTIME, "run", "--rm",
+        *user_ns_args(),
+        *network_args(),
+        "--name", instance_name,
+        "--hostname", instance_id,
+        *host_internal_args(),
+        *env_args,
+        *publish_args,
+        "-v", f"{ns_dir}:{CONTAINER_HOME}:z",
+        *workdir_mount,
+        "-w", container_workdir,
+        "-it",
+        image,
+    ]
 
-        if not cidfile.exists():
-            return rc
-
-        cid = cidfile.read_text().strip()
-
-        try:
-            if deferred:
-                # Status line because on slower hosts the cp+rm phase can take
-                # a couple seconds — without this the shell appears to hang
-                # after `logout`, and the natural reflex is Ctrl+C.
-                sys.stderr.write("aetherion: cleaning up container...\n")
-                sys.stderr.flush()
-                preserve_agent_state(cid, deferred, data_dir)
-        finally:
-            subprocess.run(
-                [CONTAINER_RUNTIME, "rm", "-f", cid],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-    return rc
+    return subprocess.run(run_argv).returncode
 
 
 def _image_exists(image: str) -> bool:
@@ -541,6 +593,23 @@ def _image_exists(image: str) -> bool:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     ).returncode == 0
+
+
+def _image_id(image: str) -> str | None:
+    """Return the runtime's content-digest ID for image, or None if the
+    runtime can't read it (image absent, runtime error). Format is whatever
+    the runtime emits — podman and docker each have their own conventions;
+    we only ever compare values produced by the same runtime, so we don't
+    normalize."""
+    p = subprocess.run(
+        [CONTAINER_RUNTIME, "image", "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+    out = p.stdout.strip()
+    return out or None
 
 
 def _build_image(image: str, context: Path, *, refresh_layers: bool = False) -> int:
@@ -685,74 +754,281 @@ def _extract_bundle(dest: Path) -> int:
     return 0
 
 
-def preserve_agent_state(cid: str, deferred: list[tuple[str, str]], data_dir: Path) -> None:
-    # Try `<runtime> cp` directly for each deferred path. cp returns non-zero
-    # when the source path doesn't exist in the container, which we treat as
-    # "agent was never used this session, skip". We used to run `<runtime>
-    # diff` first to filter, but that walks the entire container filesystem;
-    # on a rich dev image the walk is slow enough that exit feels like a
-    # hang. Going straight to cp is O(deferred paths) instead.
-    for agent, rel in deferred:
-        container_path = f"{CONTAINER_HOME}/{rel}"
-        host_path = data_dir / rel
-        if extract(cid, container_path, host_path):
-            sys.stderr.write(f"aetherion: preserved {agent} state at {host_path}\n")
+def _seed_namespace(image: str, ns_dir: Path) -> int:
+    """Populate `ns_dir` from the image's /home/aetherion. Caller must
+    ensure `ns_dir` does not exist yet. Extracts to a staging sibling and
+    atomically renames into place so a SIGINT mid-copy never leaves a
+    half-populated namespace visible to the next launch."""
+    sys.stderr.write(
+        f"aetherion: seeding namespace at {ns_dir} from {image} "
+        "(copies the image's $HOME including nvim plugins, treesitter "
+        "parsers, gopls, etc.; may take a minute)...\n"
+    )
+    sys.stderr.flush()
 
+    ns_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = ns_dir.with_name(ns_dir.name + ".tmp-seed")
+    _rmtree_any(staging)
+    staging.mkdir()
+    # The in-container cp runs as UID 1000 (mapped to the launcher's host
+    # UID on macOS docker desktop / rootless podman keep-id; possibly a
+    # different host UID on Linux-native docker). Granting world-write
+    # on the staging *entry point* avoids EACCES when the container UID
+    # doesn't line up with whoever created the dir; the populated
+    # contents inside keep their image-source modes.
+    staging.chmod(0o777)
 
-def extract(cid: str, src_in_container: str, dst_on_host: Path) -> bool:
-    dst_on_host.parent.mkdir(parents=True, exist_ok=True)
-
-    # Stage to a sibling tmp path so the final move into place is an atomic
-    # rename on the same filesystem — no half-written config visible to a
-    # future run.
-    staging = dst_on_host.with_name(dst_on_host.name + ".tmp-extract")
-    _remove(staging)
-
-    cp = subprocess.run(
-        [CONTAINER_RUNTIME, "cp", f"{cid}:{src_in_container}", str(staging)],
-        stdout=subprocess.DEVNULL,
+    # Delegate the copy to GNU cp inside the container instead of
+    # `<runtime> cp` from the host. Reasons:
+    #   1. Cross-platform tar/cp quirks (macOS bsdtar lacking GNU
+    #      semantics) never apply — everything runs in the container's
+    #      Linux userspace.
+    #   2. `<runtime> cp` extracts directory entries in tar order: it
+    #      creates a 0555 dir, then tries to mkdir children inside it
+    #      and hits EACCES.
+    #   3. One container invocation instead of three (create + cp + rm).
+    #
+    # Pre-pass: chmod -R u+w on the source tree. This is needed because
+    # GNU cp's final "restore directory mode" step ALWAYS runs on
+    # recursive copies — and for source dirs at 0555 (the Go module
+    # cache convention under ~/go/pkg/mod), the target mode after
+    # `src_mode & ~umask` is still 0555. On macOS Docker Desktop's
+    # bind-mount driver (gRPC-fuse / VirtIOFS), any chmod that removes
+    # write permission from a bind-mounted file is rejected with EACCES.
+    # Pre-adding owner-write to the source means the final chmod lands
+    # at 0755-ish (writable, no driver rejection). The chmod writes
+    # land in the container's RW overlay layer — the image's
+    # underlying read-only layers are unchanged — and get discarded
+    # when --rm fires. The trailing `|| true` ignores chmod noise on
+    # any entries we don't own (none expected in /home/aetherion, but
+    # safe).
+    #
+    # We use `cp -a` for the actual copy: preserves symlinks, ownership
+    # (a no-op when src and dst are both UID 1000 anyway), timestamps,
+    # and mode bits (now all writable thanks to the pre-pass), so
+    # executable bits on ~/.local/bin/aetherion, compiled treesitter
+    # parsers, and similar carry through.
+    script = (
+        f"chmod -R u+w {CONTAINER_HOME} 2>/dev/null || true; "
+        f"cp -a {CONTAINER_HOME}/. /staging/"
+    )
+    run = subprocess.run(
+        [
+            CONTAINER_RUNTIME, "run", "--rm",
+            *user_ns_args(),
+            "-v", f"{staging}:/staging:z",
+            "--entrypoint", "bash",
+            image,
+            "-c", script,
+        ],
         stderr=subprocess.PIPE,
     )
+    if run.returncode != 0:
+        sys.stderr.write(
+            f"aetherion: failed to copy {CONTAINER_HOME} out of image:\n"
+            f"{run.stderr.decode(errors='replace')}"
+        )
+        _rmtree_any(staging)
+        return 1
 
-    if cp.returncode != 0:
-        _remove(staging)
-        return False
+    image_id = _image_id(image)
+    if image_id:
+        stamp = staging / IMAGE_ID_STAMP
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(image_id + "\n")
 
-    # Defensive: dst shouldn't exist (deferred = not on host at launch), but
-    # if a concurrent run raced us, clear it so os.replace can land cleanly
-    # even when staging is a directory. If that clear fails (ENOTEMPTY) or
-    # the replace fails, another aetherion container is actively writing the
-    # same path — its os.replace landed an atomic snapshot under us, and
-    # ours would either overwrite half of it or hit a deeper race. Keep the
-    # other session's copy on disk; discard our staging. The user sees a
-    # one-line note explaining the situation, not a traceback.
     try:
-        _remove(dst_on_host)
-        os.replace(staging, dst_on_host)
+        os.replace(staging, ns_dir)
     except OSError as e:
         if e.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            # Another launcher raced us and populated the namespace
+            # first. Theirs wins — discard ours and continue as if
+            # seeding succeeded (because, from our caller's perspective,
+            # it did: the namespace is now populated).
             sys.stderr.write(
-                f"aetherion: skipped {dst_on_host.name}: another aetherion "
-                f"session is writing {dst_on_host} concurrently. Kept the "
-                f"other session's copy; this session's changes were "
-                f"discarded. (Normal when running multiple aetherion "
-                f"containers in parallel — no action needed.)\n"
+                f"aetherion: namespace at {ns_dir} was populated by "
+                "another aetherion process while we were seeding; "
+                "discarded our copy.\n"
             )
+            _rmtree_any(staging)
+            return 0
+        raise
+    return 0
+
+
+def _warn_on_image_drift(image: str, ns_dir: Path) -> None:
+    """Print a one-liner when the image's current content-digest doesn't
+    match the digest this namespace was seeded from. Doesn't auto-refresh —
+    user-installed tools and customizations under $HOME are theirs to
+    decide about. Silent on missing stamp / runtime inspect failure."""
+    current = _image_id(image)
+    if current is None:
+        return
+    stamp = ns_dir / IMAGE_ID_STAMP
+    try:
+        stamped = stamp.read_text().strip() or None
+    except OSError:
+        stamped = None
+    if stamped is None or current == stamped:
+        return
+    sys.stderr.write(
+        f"aetherion: namespace at {ns_dir} was seeded from a different build "
+        f"of {image} ({stamped[:19]}...); current image is {current[:19]}.... "
+        "Defaults baked into the image (skeleton config, vendor CLIs, npm "
+        "globals, nvim plugins, etc.) are frozen at the seed; in-container "
+        "customizations under $HOME persist as-is. Run "
+        "`aetherion --reset-namespace` to drop customizations and re-seed.\n"
+    )
+
+
+def _list_namespaces(home: Path) -> int:
+    """Print every namespace under ~/.aetherion/namespaces/ to stdout
+    alongside the image digest it was seeded from, sorted by name.
+    Suppresses staging dirs (`*.tmp-seed` from in-flight or interrupted
+    seeds) so they don't masquerade as namespaces."""
+    ns_root = _namespaces_dir(home)
+    if not ns_root.is_dir():
+        sys.stderr.write(
+            f"aetherion: no namespaces yet at {ns_root}.\n"
+            "aetherion: run `aetherion` to create the default namespace.\n"
+        )
+        return 0
+    entries = sorted(
+        p for p in ns_root.iterdir()
+        if p.is_dir() and not p.name.endswith(".tmp-seed")
+    )
+    if not entries:
+        sys.stderr.write(
+            f"aetherion: no namespaces yet under {ns_root}.\n"
+            "aetherion: run `aetherion` to create the default namespace.\n"
+        )
+        return 0
+
+    name_w = max(len("NAMESPACE"), max(len(p.name) for p in entries))
+    fmt = f"{{:<{name_w + 2}}}{{}}\n"
+    sys.stdout.write(fmt.format("NAMESPACE", "SEEDED FROM"))
+    for p in entries:
+        stamp = p / IMAGE_ID_STAMP
+        try:
+            text = stamp.read_text().strip() if stamp.exists() else ""
+        except OSError:
+            text = ""
+        # Truncate the digest so the table stays readable. Format varies
+        # by runtime (podman keeps the `sha256:` prefix; docker drops it),
+        # so cap on character count rather than slicing past the prefix.
+        if text:
+            seed = text[:19] + "..." if len(text) > 22 else text
         else:
+            seed = "(no image-id stamp)"
+        sys.stdout.write(fmt.format(p.name, seed))
+    return 0
+
+
+def _reset_namespace(image: str, ns_dir: Path, *, namespace: str, force: bool) -> int:
+    if not ns_dir.exists():
+        sys.stderr.write(
+            f"aetherion: namespace {namespace!r} does not exist at {ns_dir}; "
+            "nothing to reset.\n"
+            f"aetherion: create it with `aetherion --namespace {namespace} "
+            "--create-namespace`.\n"
+        )
+        return 0
+    if not force:
+        if not sys.stdin.isatty():
             sys.stderr.write(
-                f"aetherion: failed to preserve {dst_on_host}: {e}. "
-                f"This session's changes were discarded.\n"
+                "aetherion: --reset-namespace requires a tty for "
+                "confirmation, or pass --force to skip the prompt.\n"
             )
-        _remove(staging)
-        return False
-    return True
+            return 2
+        sys.stderr.write(
+            f"aetherion: this will delete namespace {namespace!r} at {ns_dir} "
+            f"and re-seed from {image}.\n"
+            "aetherion: all in-container customizations in this namespace "
+            "(agent logins, npm globals, go binaries, nvim plugin updates, "
+            "shell history, etc.) will be lost.\n"
+            "aetherion: continue? [y/N] "
+        )
+        sys.stderr.flush()
+        reply = sys.stdin.readline().strip().lower()
+        if reply not in ("y", "yes"):
+            sys.stderr.write("aetherion: aborted.\n")
+            return 1
+    shutil.rmtree(ns_dir)
+    return _seed_namespace(image, ns_dir)
 
 
-def _remove(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif path.exists() or path.is_symlink():
+def _migrate_legacy_data(image: str, home: Path) -> int:
+    """One-shot: fold the old per-agent layout under ~/.aetherion/data into
+    the new ~/.aetherion/namespaces/default layout. Runs only when legacy
+    data exists and the default namespace does not — i.e. exactly once per
+    host, on the first launch after upgrading to the namespaces design.
+    Legacy state was namespace-less, so 'default' is its natural home.
+
+    Order: seed the default namespace from the image first (fresh defaults),
+    then overlay-copy each top-level entry from legacy data on top so
+    existing agent logins and other saved state win over the image's empty
+    placeholders. Finally rename the legacy dir aside as a safety net the
+    user can delete once they've confirmed the new layout works."""
+    legacy = _legacy_data_dir(home)
+    default_ns = _namespace_dir(home, DEFAULT_NAMESPACE)
+    if not legacy.is_dir() or default_ns.exists():
+        return 0
+    sys.stderr.write(
+        f"aetherion: migrating legacy {legacy} into the new "
+        f"~/.aetherion/{NAMESPACES_DIRNAME}/{DEFAULT_NAMESPACE} namespace.\n"
+    )
+    rc = _seed_namespace(image, default_ns)
+    if rc != 0:
+        return rc
+    for entry in legacy.iterdir():
+        dst = default_ns / entry.name
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.copytree(entry, dst, dirs_exist_ok=True, symlinks=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(entry, dst, follow_symlinks=False)
+
+    today = datetime.date.today().strftime("%Y%m%d")
+    archive = legacy.with_name(f"{legacy.name}.migrated-{today}")
+    # If a previous failed migration left an archive at the same date,
+    # suffix with a counter so we don't clobber it.
+    n = 2
+    final_archive = archive
+    while final_archive.exists():
+        final_archive = archive.with_name(f"{archive.name}.{n}")
+        n += 1
+    legacy.rename(final_archive)
+    sys.stderr.write(
+        f"aetherion: legacy state preserved at {final_archive}; delete it "
+        "once you've confirmed the new layout works.\n"
+    )
+    return 0
+
+
+def _rmtree_any(path: Path) -> None:
+    """Remove path whether it's a file, symlink, or directory. No-op if
+    absent. Used by the seeding path to clear stale staging dirs without
+    caring what's there.
+
+    Handles read-only directories: Go's module cache deliberately sets
+    parent dirs to 0555 with content underneath, and shutil.rmtree fails
+    on those because it can't unlink children inside a non-writable parent.
+    We pre-walk and grant owner-write on every directory before the rmtree
+    call so cleanup of a partial seed (or a reset of an established
+    namespace) actually completes."""
+    if path.is_symlink() or path.is_file():
         path.unlink()
+        return
+    if not path.is_dir():
+        return
+    for root, _dirs, _files in os.walk(path):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            # If we can't chmod (e.g. someone else owns it), let rmtree
+            # surface the underlying error so it's not silently swallowed.
+            pass
+    shutil.rmtree(path)
 
 
 if __name__ == "__main__":
