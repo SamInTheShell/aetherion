@@ -508,18 +508,41 @@ def main(argv: list[str] | None = None) -> int:
     # inside the container too. Anything outside $HOME is mounted at its real
     # path, since there's no portable home-relative form for it.
     if pwd == home:
-        # The namespace mount already covers /home/aetherion. Adding a
-        # second -v for the host home at the same target would either error
-        # or silently shadow the namespace (defeating the whole feature),
-        # so we skip the workdir bind and let the user land in the
-        # namespace's $HOME. Behavior change vs the old layout: running
-        # `aetherion` from your host $HOME no longer exposes host $HOME to
-        # the container; cd into a subdirectory (or pass an explicit -v) if
-        # you want that.
-        container_workdir = CONTAINER_HOME
-        workdir_mount: list[str] = []
+        # Launching from host $HOME is ambiguous: the namespace's $HOME is
+        # already the container's $HOME, so there's no sensible workdir
+        # mount we could add. Hard-fail instead of silently landing the
+        # user in the namespace $HOME — the silent-rewrite behavior tripped
+        # people up because `aetherion` from ~ felt like it should put them
+        # "in the same place" inside, but it doesn't.
+        sys.stderr.write(
+            f"aetherion: refusing to launch from your home directory ({home}).\n"
+            "aetherion: cd into a project directory first. The container's "
+            "$HOME is the namespace at "
+            f"{ns_dir}, so there's no useful workdir we could mount from "
+            "your host $HOME here.\n"
+        )
+        return 2
     elif home in pwd.parents:
         container_workdir = f"{CONTAINER_HOME}/{pwd.relative_to(home)}"
+        # A workdir mount under $HOME lands on top of whatever's at the
+        # same relative path inside the namespace. Empty dirs are fine
+        # (mount-point stubs auto-created by prior runs as a side effect),
+        # but real content — seeded skeleton files, anything the user put
+        # there inside the container — would be silently shadowed. Refuse
+        # in that case so the user notices and either clears the namespace
+        # path or cd's somewhere else.
+        ns_path = ns_dir / pwd.relative_to(home)
+        if ns_path.exists() and (
+            not ns_path.is_dir() or any(ns_path.iterdir())
+        ):
+            sys.stderr.write(
+                f"aetherion: refusing to mount {pwd} over {container_workdir}: "
+                f"{ns_path} already has content in the namespace and that "
+                "content would be hidden by the mount.\n"
+                f"aetherion: either cd elsewhere, or clear {ns_path} first "
+                "if you really want the host directory to take over.\n"
+            )
+            return 2
         workdir_mount = ["-v", f"{pwd}:{container_workdir}:z"]
     else:
         container_workdir = str(pwd)
