@@ -396,6 +396,29 @@ def _parse_forward_spec(raw: str) -> str:
     return f"{addr}:{host_port}:{container_port}"
 
 
+def _has_real_content(path: Path) -> bool:
+    """True if `path` contains any non-directory entry, anywhere in its tree.
+
+    Empty-directory stubs (left behind by prior mounts) don't count; files,
+    symlinks, sockets, etc. do. Bails on the first match, so populated paths
+    are detected in O(depth-to-first-file) syscalls rather than a full walk.
+    """
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    return True
+                if _has_real_content(Path(entry.path)):
+                    return True
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        # Can't read it from the host UID — assume content and refuse the
+        # mount so the user investigates rather than silently shadowing.
+        return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     # argv=None lets the console-script entry point (pyproject.toml) call
     # main() with no args while keeping the parameter explicit for tests
@@ -533,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         # path or cd's somewhere else.
         ns_path = ns_dir / pwd.relative_to(home)
         if ns_path.exists() and (
-            not ns_path.is_dir() or any(ns_path.iterdir())
+            not ns_path.is_dir() or _has_real_content(ns_path)
         ):
             sys.stderr.write(
                 f"aetherion: refusing to mount {pwd} over {container_workdir}: "
