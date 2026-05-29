@@ -11,11 +11,11 @@ so image rebuilds deliver new versions to every workspace immediately.
 The `aetherion` launcher mounts the current directory inside the
 container and bind-mounts a host directory as `$HOME` — agent logins,
 shell history, and per-user tool state persist across sessions. Multiple
-independent **namespaces** (each its own `$HOME`) let you keep separate
-identities, model setups, or experiments side by side without cross-talk.
-A second CLI, `conduit`, ships alongside and points the agents at a
-model server running on your host (Ollama, LM Studio, or any
-OpenAI-compatible endpoint).
+independent **namespaces** (each its own `$HOME`, its own image, its own
+build dir) let you keep separate identities, model setups, or
+experiments side by side without cross-talk. A second CLI, `conduit`,
+ships alongside and points the agents at a model server running on your
+host (Ollama, LM Studio, or any OpenAI-compatible endpoint).
 
 ## Install
 
@@ -34,8 +34,10 @@ uv tool upgrade aetherion
 ## Quickstart
 
 ```shell
-aetherion --build-image                  # one-time: build localhost/aetherion:dev
-aetherion                                # first run auto-creates the 'default' namespace and enters
+aetherion                                # first run bootstraps the 'default'
+                                         # namespace (writes ~/.aetherion/config.yaml,
+                                         # populates the build dir, builds the
+                                         # image, seeds $HOME, then enters)
 ```
 
 Inside the container, point agents at your host's model server:
@@ -82,7 +84,8 @@ aetherion --forward-openclaw '[::1]:9999'     # IPv6 loopback, custom port
 Then open `http://<host-bind>:<host-port>` on the host (container-side
 port is always 18789 — openclaw's own). For ports that already bind
 0.0.0.0 inside the container, `--forward CONTAINER_PORT` (repeatable) is
-enough — no bridge needed.
+enough — no bridge needed. For permanent setups, declare the same in the
+namespace's `port-forwarding:` block in `~/.aetherion/config.yaml`.
 
 ## What's in the container
 
@@ -100,77 +103,132 @@ the namespace's `$HOME`.
 
 ## Namespaces
 
-A namespace is an independent host directory at
-`~/.aetherion/namespaces/<name>/` that the launcher bind-mounts as the
-container's `$HOME`. Everything that lives under `$HOME` inside the
-container — agent logins, runtime-installed npm/go/uv tools, nvim plugins
-once you've launched nvim, shell history, dotfile edits — is just files
-in that host directory and survives across sessions. Two namespaces
-share zero state: logging into Claude under `work` doesn't log you in
-under `play`.
+A namespace is a single unit composed of four things on the host:
 
-The first time a namespace is used, the launcher seeds it from the
-image's `/home/aetherion`. The seed is small — just the skeleton
-dotfiles (`.bashrc`, `.npmrc`, `.config/nvim/`, `.config/starship.toml`)
-— because system tools and agent binaries live outside `$HOME` in the
-image. First entry is near-instant; first `nvim` launch in a namespace
-then runs Lazy's plugin install (a few minutes; cached afterward) and
-treesitter parsers compile on first file open.
+- a `$HOME` at `~/.aetherion/namespaces/<name>/` (bind-mounted into the container),
+- a build directory at `~/.aetherion/containers/<name>/` (Dockerfile + skeleton),
+- an image tag `localhost/aetherion:<name>`,
+- and an entry under `namespaces:` in `~/.aetherion/config.yaml` tying them together.
+
+Everything that lives under `$HOME` inside the container — agent logins,
+runtime-installed npm/go/uv tools, nvim plugins once you've launched
+nvim, shell history, dotfile edits — is just files in the namespace dir
+and survives across sessions. Two namespaces share zero state: logging
+into Claude under `work` doesn't log you in under `play`, and the
+`work` image can carry tools the `play` image doesn't.
 
 ```shell
-aetherion                                 # auto-creates 'default' on first use, then enters
-aetherion --namespace work --create-namespace
-aetherion -n work                         # next launches into 'work'
-aetherion --list-namespaces               # show what's been created and what image each came from
-aetherion --reset-namespace               # nuke 'default' and re-seed from current image
-aetherion -n work --reset-namespace --force
+aetherion                                   # bootstrap + launch the default namespace
+aetherion work                              # launch into 'work' (must exist)
+aetherion work --create                     # create 'work' on the fly, then launch
+aetherion work nvim                         # run nvim instead of an interactive shell
+aetherion work --join aetherion-a1b2c3d4    # exec into an already-running session
+
+aetherion create namespace work             # explicit creation (without launching)
+aetherion list namespaces                   # see what's registered
+aetherion list sessions                     # see running containers
+aetherion reset namespace work              # wipe $HOME and re-seed from the image
+aetherion rebuild namespace work            # rebuild the namespace's image
+aetherion delete namespace work             # remove $HOME, build dir, image, config entry
 ```
+
+`create namespace` does four things in one shot: populates the build dir
+from the bundled Dockerfile + skeleton, builds
+`localhost/aetherion:<name>`, seeds `$HOME` by `cp -a`-ing the freshly
+built image's `/home/aetherion` out, and registers the namespace in
+`~/.aetherion/config.yaml`. First launch into a new namespace is
+working-environment-immediately — nvim plugins are already compiled into
+the image, agent CLIs are already on `PATH`, and shell history starts
+fresh.
+
+Reserved namespace names: `config`, `list`, `create`, `reset`, `rebuild`,
+`delete` — they're the verbs `aetherion` dispatches on, so they can't
+double as namespaces.
 
 ### What updates when, and what doesn't
 
-- **System tools (image-managed)**: `aetherion`, `conduit`, every agent CLI, every LSP/DAP, language runtimes. Rebuild the image and every existing namespace gets the new version on next launch — nothing to migrate.
-- **Namespace contents (your state)**: agent logins, `npm install -g` packages, `go install`-ed binaries, nvim plugins, shell history, anything you `touch`ed inside. Stays put across image upgrades. To reset, use `--reset-namespace`.
-- **Skeleton dotfiles (frozen at seed)**: `.bashrc`, `.npmrc`, `.config/nvim/`, `.config/starship.toml`. These are captured into the namespace at seed time and don't refresh when the image changes — if a new image ships a `.bashrc` you want, the launcher prints a one-line drift notice on launch suggesting `aetherion --reset-namespace` (which drops everything else in the namespace too, so use with care).
+- **System tools (image-managed)**: `aetherion`, `conduit`, every agent CLI, every LSP/DAP, language runtimes. Run `aetherion rebuild namespace <name>` to refresh the image; the next launch picks it up.
+- **Namespace contents (your state)**: agent logins, `npm install -g` packages, `go install`-ed binaries, nvim plugins, shell history, anything you `touch`ed inside. Stays put across rebuilds. To reset, use `aetherion reset namespace <name>`.
+- **Skeleton dotfiles (frozen at seed)**: `.bashrc`, `.npmrc`, `.config/nvim/`, `.config/starship.toml`. Captured into the namespace at seed time; they don't refresh when the image changes. If a new image ships a `.bashrc` you want, the launcher prints a one-line drift notice suggesting `aetherion reset namespace <name>` — which drops every other namespace customization too, so use with care.
 
-### Migrating from older aetherion
+## Configuration
 
-A prior install's `~/.aetherion/data/` (the per-agent layout) is
-auto-migrated into the `default` namespace on next launch: the launcher
-seeds `default` from the current image, overlays the legacy per-agent
-dirs (`.claude/`, `.gemini/`, `go/`, etc.) on top so existing logins win,
-and renames the old directory to `data.migrated-YYYYMMDD` as a safety
-net. Delete the safety copy once you've confirmed everything works.
+`~/.aetherion/config.yaml` is the source of truth for every namespace. The
+launcher writes a minimal version on first run; edit it yourself or open
+it via `aetherion config` (uses `$EDITOR`, falls back to `vi`).
 
-## Flags
+A minimal namespace declaration is just an image tag and a build dir:
+
+```yaml
+namespaces:
+  default:
+    image: "localhost/aetherion:default"
+    buildDir: "~/.aetherion/containers/default/"
+```
+
+Optional per-namespace fields cover environment, ports, and extra mounts:
+
+```yaml
+namespaces:
+  work:
+    image: "localhost/aetherion:work"
+    buildDir: "~/.aetherion/containers/work/"
+    environment:
+      fromMap:
+        FOO: BAR                                          # literal value
+      fromFile:
+        OPENAI_API_KEY: "~/.aetherion/secrets/openai"     # value = file contents
+      fromEnv:
+        GH_TOKEN: GH_TOKEN                                # inherit host env (rename ok)
+    port-forwarding:
+      - hostInterface: "127.0.0.1"
+        hostPort: 8080
+        containerPort: 5000
+    volumes:
+      - "~/repos/abc"                       # host ~/repos/abc → container ~/repos/abc
+      - "~/repos/ZYX:~/repos/xyz"           # rename: host ~/repos/ZYX → container ~/repos/xyz
+```
+
+`buildDir:` may point anywhere; it doesn't have to live under
+`~/.aetherion/containers/`. Custom paths are left alone on
+`delete namespace` (only the default-location build dir is auto-removed).
+
+CLI flags on the launch form layer on top of the YAML config — they don't
+replace it. Use them for one-offs:
 
 | flag | purpose |
 | --- | --- |
-| `-n`, `--namespace NAME` | Namespace whose `$HOME` to mount. Default: `default` (auto-created on first use). Other namespaces error if they don't exist; pair with `--create-namespace`. Names: letters, digits, dot, underscore, dash (no leading dot). |
-| `--create-namespace` | Create the namespace selected by `-n` if it doesn't exist (seeded from the current image). No-op when it already exists. Not needed for `default`. Combines with launch. |
-| `--list-namespaces` | List existing namespaces with the image digest each was seeded from, then exit. |
-| `--reset-namespace` | Delete the namespace selected by `-n` and re-seed from the current image, then exit. Drops every in-namespace customization. Confirms unless `--force` is also passed. |
-| `--force` | Skip the confirmation prompt for `--reset-namespace`. |
-| `-e`, `--env NAME=VALUE` | Set a container environment variable. Repeatable. Quote at the shell for values with spaces: `--env 'NAME=has spaces'`. A bare `--env NAME` inherits from the host environment. |
-| `--forward [ADDR:[HOST_PORT:]]CONTAINER_PORT` | Publish a container port (podman/docker `-p` semantics). Repeatable. Forms: `PORT`, `HOST:CONTAINER`, `ADDR:HOST:CONTAINER`, `:HOST:CONTAINER`, `[::1]:HOST:CONTAINER`. Default host bind is `127.0.0.1`. Services that bind 127.0.0.1 inside the container won't be reachable through this alone — use a `--forward-<agent>` alias. |
-| `--forward-openclaw [ADDR][:PORT]` | Convenience alias for OpenClaw's gateway (container port 18789). Publishes the port AND sets up a loopback bridge so the publish actually reaches it (openclaw binds 127.0.0.1 inside the container). Bare = `127.0.0.1:18789`; otherwise accepts `ADDR`, `PORT`, `ADDR:PORT`, `:PORT`, `[::1]:PORT`. |
-| `--image REF` | Image ref to run, and to tag when building. Default: `localhost/aetherion:dev`. |
-| `--build-image` | Build the image and exit. Does not launch the container. |
-| `--build-dir PATH` | Build context directory. Defaults to the Dockerfile bundled with the launcher. |
-| `--refresh-layers` | Discard the runtime's build cache for this build (`--no-cache`). Use to refresh anything pinned by an intermediate layer's snapshot: apt mirrors, the Node.js LTS tarball, the system npm install of agent CLIs, the `cursor.com/install` script, hermes-agent's PyPI release, the gopls/dlv `go install`. Without it you stay on whatever was current the first time the layer was built; with it every upstream gets re-fetched. Only meaningful with `--build-image`. |
-| `--extract PATH` | Copy the bundled Dockerfile and skeleton/ to PATH and exit. |
+| `--image REF` | Use a different image for this launch only (overrides the namespace's `image:`). |
+| `-e`, `--env NAME=VALUE` | Add one env var (repeatable). Bare `--env NAME` inherits from the host. |
+| `--forward [ADDR:[HOST_PORT:]]CONTAINER_PORT` | Publish a port (repeatable). Forms: `PORT`, `HOST:CONTAINER`, `ADDR:HOST:CONTAINER`, `:HOST:CONTAINER`, `[::1]:HOST:CONTAINER`. |
+| `-v`, `--volume SRC[:DST]` | Mount a host path (repeatable). DST defaults to SRC; `~/` in DST anchors at the container's `$HOME` (`/home/aetherion`). |
+| `--forward-openclaw [ADDR][:PORT]` | OpenClaw convenience — publishes container port 18789 *and* sets up the loopback bridge required to reach it. Bare = `127.0.0.1:18789`. |
+| `--create` | Create the named namespace if it doesn't exist (then launch). |
+| `--join SESSION` | `exec -it` into a running session (see `aetherion list sessions`). Drops at `bash` unless a trailing command is given. |
 
-`AETHERION_CONTAINER_RUNTIME=docker` overrides runtime auto-detection (podman is preferred when both are available).
+`AETHERION_CONTAINER_RUNTIME=docker` overrides runtime auto-detection
+(podman is preferred when both are available).
 
 ## Customizing the image
 
-The launcher ships its own Dockerfile and skeleton tree inside the Python
-package. To fork them:
+Each namespace has its own build context — edit it in place, then
+rebuild:
 
 ```shell
-aetherion --extract ~/my-aetherion
-$EDITOR ~/my-aetherion/Dockerfile
-aetherion --build-image --build-dir ~/my-aetherion --image my:tag
-aetherion --image my:tag
+$EDITOR ~/.aetherion/containers/default/Dockerfile
+aetherion rebuild namespace default
+```
+
+`rebuild` leaves your `Dockerfile` and `skeleton/` edits untouched and
+only refreshes the bundled `aetherion-src/` overlay (used by the
+Dockerfile's `uv tool install`). Pass `--no-cache` to force every layer
+to re-fetch (e.g. when an apt mirror or upstream installer is pinned by
+a cached layer). To start over from the bundled defaults, delete the
+namespace and re-create it:
+
+```shell
+aetherion delete namespace default
+aetherion                                   # bootstraps fresh
 ```
 
 ## Development
@@ -193,3 +251,8 @@ make publish    # upload dist/* to PyPI (UV_PUBLISH_TOKEN required)
 The container image itself has `uv` plus the standard CPython toolchain
 installed, so you can also run `make publish` from inside an `aetherion`
 shell if you prefer keeping credentials in the container.
+
+When `aetherion` runs from a source checkout, `create namespace` and
+`rebuild namespace` overlay your live `src/` tree into the namespace's
+build dir so in-progress edits flow into the next image build without a
+PyPI publish.
