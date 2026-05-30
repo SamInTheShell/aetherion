@@ -163,7 +163,7 @@ participate, user winning on name collisions:
 
 - **Baked-in** ships inside the package at `src/aetherion/data/templates/<name>/`. Out of the box:
   - `default` — the full dev image (every agent CLI, Neovim+LSPs, language toolchains).
-  - `cursor-ide` — Cursor IDE (Electron) with X11 forwarding into the host. The Dockerfile detects host arch at build time and pulls the matching native `linux-x64` or `linux-arm64` AppImage (no emulation on either side), and bundles Firefox-ESR so the OAuth sign-in round-trip stays entirely inside the namespace — no host browser or `cursor://` URL-handler setup required.
+  - `cursor-ide` — Cursor IDE (Electron) with X11 forwarding into the host. The Dockerfile detects host arch at build time and pulls the matching native `linux-x64` or `linux-arm64` AppImage (no emulation on either side), and bundles Firefox-ESR so the OAuth sign-in round-trip stays entirely inside the namespace — no host browser or `cursor://` URL-handler setup required. Supports linux *and* darwin hosts: on darwin the launcher auto-configures XQuartz's TCP listener + `xhost`, and the cursor wrapper switches Chromium to ANGLE-via-SwiftShader (in-process software GL) so the renderer survives the docker-VM hop. Bare `aetherion cursor-ide` opens Cursor instead of bash (`defaults.command: cursor` in the template).
 - **User-defined** lives at `~/.aetherion/templates/<name>/`. Same shape; you write whatever Dockerfile you want.
 
 A user template of the same name as a baked-in one shadows it; deleting
@@ -177,13 +177,23 @@ platforms and per-namespace defaults. Schema:
 ```yaml
 description: "Cursor IDE (Electron, native amd64/arm64) with X11 forwarding."
 platforms:
-  - { os: linux, arch: amd64, runtime: podman }
-  - { os: linux, arch: amd64, runtime: docker }
-  - { os: linux, arch: arm64, runtime: podman }
-  - { os: linux, arch: arm64, runtime: docker }
+  - { os: linux,  arch: amd64, runtime: podman }
+  - { os: linux,  arch: amd64, runtime: docker }
+  - { os: linux,  arch: arm64, runtime: podman }
+  - { os: linux,  arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
 defaults:
   display: x11        # written into the namespace's config.yaml at create
+  command: cursor     # bare `aetherion <ns>` runs cursor instead of bash
 ```
+
+`defaults.command` accepts either a string (shlex-split into argv) or a
+list of strings (used verbatim, the way to spell argv elements that
+contain whitespace). Unset ⇒ the launcher falls through to the image's
+`CMD` (bash for every baked-in template).
 
 `create namespace --template <name>` validates the current host against
 `platforms:` and fails with a clear error if the combo isn't supported.
@@ -244,6 +254,7 @@ namespaces:
     image: "localhost/aetherion:work"
     buildDir: "~/.aetherion/containers/work/"
     template: "https://github.com/me/aetherion-template.git#v1.2.0"
+    command: cursor                                       # default when no trailing command; string (shlex-split) or list
     environment:
       fromMap:
         FOO: BAR                                          # literal value
@@ -275,6 +286,7 @@ replace it. Use them for one-offs:
 | `-v`, `--volume SRC[:DST]` | Mount a host path (repeatable). DST defaults to SRC; `~/` in DST anchors at the container's `$HOME` (`/home/aetherion`). |
 | `--forward-openclaw [ADDR][:PORT]` | OpenClaw convenience — publishes container port 18789 *and* sets up the loopback bridge required to reach it. Bare = `127.0.0.1:18789`. |
 | `--display x11\|wayland\|auto\|none` | Override display forwarding for this launch. See **Display forwarding** below for what each mode mounts. |
+| `--command "CMD [ARG...]"` | Override the namespace's default command (shlex-split into argv). Resolution: positional `COMMAND [ARG...]` after the namespace wins first, then `--command`, then the namespace YAML's `command:` field, then the image's `CMD`. |
 | `--create` | Create the named namespace if it doesn't exist (then launch). |
 | `--template SPEC` | When paired with `--create`, fork from SPEC (local name or git URL[#REF]) instead of `default`. Ignored without `--create`. |
 | `--join SESSION` | `exec -it` into a running session (see `aetherion list sessions`). Drops at `bash` unless a trailing command is given. |
@@ -299,9 +311,9 @@ built-in `none`.
 
 Modes:
 
-- **`x11`** — mounts `/tmp/.X11-unix`, passes `DISPLAY` and the host's `$XAUTHORITY` (read-only at `~/.Xauthority` inside), adds `--device /dev/dri` when present, and `--ipc host` for Electron's MIT-SHM path. Works on pure X11 hosts and on Wayland hosts via XWayland (which every major Wayland compositor ships).
+- **`x11`** — mounts `/tmp/.X11-unix`, passes `DISPLAY` and the host's `$XAUTHORITY` (read-only at `~/.Xauthority` inside), adds `--device /dev/dri` when present, and `--ipc host` for Electron's MIT-SHM path. Works on pure X11 hosts and on Wayland hosts via XWayland (which every major Wayland compositor ships). On macOS, switches to a TCP path against XQuartz — see the macOS caveats below.
 - **`wayland`** — mounts the host's Wayland socket from `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` into `/run/user/1000/$WAYLAND_DISPLAY`, passes `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`. Downgrades to `none` with a warning if `$WAYLAND_DISPLAY` isn't set on the host.
-- **`auto`** — picks `wayland` when `$WAYLAND_DISPLAY` is set, otherwise `x11` when `$DISPLAY` is set, otherwise `none`. Convenient for namespaces you launch from both graphical and SSH sessions.
+- **`auto`** — picks `wayland` when `$WAYLAND_DISPLAY` is set, otherwise `x11` when `$DISPLAY` is set, otherwise `none` on Linux. On macOS, always picks `x11` (XQuartz is the only display backend). Convenient for namespaces you launch from both graphical and SSH sessions.
 - **`none`** — no GUI plumbing. Default when nothing's set.
 
 Both `x11` and `wayland` additionally:
@@ -314,35 +326,56 @@ which bundles Firefox-ESR) can complete OAuth flows entirely
 in-namespace and don't depend on the host having `xdg-desktop-portal`
 configured.
 
-The baked-in `cursor-ide` template ships `display: x11` in its
-`template.yaml` defaults, so a namespace created from it gets X11
-forwarding out of the box.
+The baked-in `cursor-ide` template ships `display: x11` and
+`command: cursor` in its `template.yaml` defaults, so a namespace
+created from it gets X11 forwarding *and* opens Cursor on launch
+without any per-namespace config edits.
 
 ### macOS host caveats
 
-Display forwarding is currently tested on Linux hosts only. On macOS
-(podman-machine or Docker Desktop), the container runs inside a Linux
-VM and the host-side plumbing the launcher reaches for —
-`/tmp/.X11-unix`, `$DISPLAY`, `$WAYLAND_DISPLAY`, `$XDG_RUNTIME_DIR`,
-`/run/dbus/system_bus_socket` — resolves against the VM, not macOS
-itself. What this means in practice:
+On macOS (Docker Desktop or podman-machine) the container runs inside a
+Linux VM, so the Linux-host plumbing the launcher normally mounts —
+`/tmp/.X11-unix`, `$XAUTHORITY`, the D-Bus buses, `/dev/dri` — would
+resolve against the VM, not macOS itself. The launcher detects darwin
+hosts and takes a separate code path:
 
-- **`display: wayland`** doesn't apply — macOS has no Wayland compositor.
-- **`display: x11`** needs [XQuartz](https://www.xquartz.org/) running on
-  the host with `$DISPLAY` pointed at the XQuartz socket (typically
-  `host.docker.internal:0` reachable from the VM) and `xhost` permissions
-  opened up to the VM's address. The launcher does none of that for you
-  today.
-- **D-Bus forwarding** silently skips — macOS has no session bus on the
-  VM side and no `xdg-desktop-portal` to talk to. Anything that would
-  rely on host portal integration (system notifications, secret-service
-  / keyring, opening a host browser via `xdg-open`) just won't carry.
-
-The `cursor-ide` template ships Firefox-ESR in the image, so once X11
-forwarding is set up, the OAuth sign-in round-trip can complete entirely
-inside the container without needing the host to handle `cursor://`.
-End-to-end macOS testing is still future work; for now, treat it as
-"might work if you can get XQuartz to behave."
+- **`display: x11`** — sets `DISPLAY=host.docker.internal:0` inside the
+  container, pointing at [XQuartz](https://www.xquartz.org/) on the
+  macOS host over TCP. No socket or D-Bus mounts. The only thing you
+  have to set up yourself is XQuartz itself:
+  ```sh
+  brew install --cask xquartz       # Homebrew: https://brew.sh
+  ```
+  Everything else — flipping `org.xquartz.X11 nolisten_tcp` to enable
+  the TCP listener, restarting XQuartz, and running `xhost +localhost`
+  to authorize the container — the launcher does on each `--display
+  x11` (or `auto` on darwin) launch. It's idempotent: a no-op when
+  things are already set up, a one-line stderr note for each step it
+  actually has to take. If XQuartz isn't installed, the launcher halts
+  with a `brew install --cask xquartz` hint instead of dropping you
+  into a doomed cursor session.
+- **`display: wayland`** — not supported (macOS has no Wayland
+  compositor); the launcher warns and skips forwarding.
+- **D-Bus forwarding** — also skipped on darwin. Notifications,
+  secret-service / keyring, and `xdg-desktop-portal` integrations
+  silently don't carry. The `cursor-ide` template ships Firefox-ESR in
+  the image, so OAuth sign-in still works end-to-end without any host
+  portal integration.
+- **Performance** — X11-over-TCP through XQuartz is *chatty* by
+  design: every primitive crosses the Docker/podman VM boundary, and
+  Electron apps in particular emit many small X requests per paint.
+  Cursor will render but feel laggy on hover, scroll, and completion
+  popups. The cursor wrapper detects the no-GPU case (`/dev/dri`
+  absent, which is always true on macOS) and adds
+  `--use-gl=angle --use-angle=swiftshader` so Chromium uses its
+  bundled in-process software GL via ANGLE instead of trying to
+  negotiate fbConfigs through XQuartz's GLX (which fails on macOS
+  and aborts the renderer with exit code 5 — and the older
+  `--use-gl=swiftshader` form, removed in Chromium 109+, asserts
+  with a Trace/breakpoint trap during GL backend init). Linux
+  hosts with `/dev/dri` keep the real GPU path. The SwiftShader
+  fallback is the floor of "works"; further optimization is
+  future work.
 
 ## Customizing the image
 

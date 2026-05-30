@@ -26,13 +26,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Electron / Chromium runtime deps + X11 client libs + fonts + locale +
 # Firefox (so the Cursor sign-in flow opens a browser inside the same
 # isolated namespace; no host xdg-desktop-portal / cursor:// handler
-# required) + tools needed for the install steps below. Single apt layer
-# keeps the image small.
+# required) + tools needed for the install steps below. Single apt
+# layer keeps the image small.
+#
+# libxkbfile1 is load-bearing for Cursor's native-keymap module on
+# Linux — without it the .node dlopen fails and Cursor crashes in the
+# main process during keyboard-layout init. apt's
+# --no-install-recommends would skip it, so list it explicitly.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         bash ca-certificates curl \
         libnss3 libatk-bridge2.0-0 libatk1.0-0 libcups2 \
-        libdrm2 libgbm1 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libdrm2 libgbm1 libxkbcommon0 libxkbfile1 libxcomposite1 libxdamage1 \
         libxrandr2 libxshmfence1 libasound2 libgtk-3-0 \
         libpangocairo-1.0-0 libpango-1.0-0 \
         libgl1-mesa-dri libgl1 libegl1 \
@@ -60,9 +65,29 @@ RUN curl -fsSL https://starship.rs/install.sh \
 # (linux-x64 / linux-arm64) and fetch the matching native AppImage. The
 # built-in FUSE mount is fragile inside rootless containers so we extract
 # once at build time and exec the resulting AppRun directly.
-# `--no-sandbox` is the v1 simplification: Chrome's namespace sandbox
-# would otherwise need SUID + cap-add gymnastics we'd rather not require
-# in the launcher just yet.
+#
+# Wrapper flags, runtime-detected:
+# - `--no-sandbox` always — Chrome's namespace sandbox would need SUID
+#   + cap-add gymnastics we'd rather not require in the launcher.
+# - `--use-gl=angle --use-angle=swiftshader` when `/dev/dri` is
+#   absent (macOS via Docker Desktop, any GPU-less Linux container).
+#   Chromium 130+ — which Cursor 3.6's Electron ships — requires
+#   *some* GL backend even with `--disable-gpu`, because its
+#   software raster path goes through GL. On macOS XQuartz over TCP
+#   the system libGL gets no matching fbConfig and the renderer
+#   aborts with exit code 5; with --use-gl=swiftshader (the
+#   pre-Chromium-109 syntax) it asserts at GL backend init with
+#   `Trace/breakpoint trap`. The current accepted form routes
+#   through ANGLE (Chromium's GL abstraction) with SwiftShader as
+#   ANGLE's software backend — ships in Electron's bundle, runs
+#   in-process, never touches X GLX. Slower than a real GPU but
+#   actually works through XQuartz forwarding. Linux hosts with
+#   `/dev/dri` keep the real GPU path (full hardware acceleration
+#   via Mesa).
+# - We intentionally do NOT add --disable-gpu / --disable-gpu-
+#   compositing / --disable-mit-shm. Those combinations reliably
+#   produced worse failure modes on the XQuartz path than leaving
+#   Chromium alone with a working GL backend.
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -79,7 +104,17 @@ RUN set -eux; \
     mv squashfs-root /opt/cursor; \
     chmod -R a+rX /opt/cursor; \
     rm -f cursor.AppImage; \
-    printf '#!/bin/sh\nexec /opt/cursor/AppRun --no-sandbox "$@"\n' \
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'flags="--no-sandbox"' \
+        '# No /dev/dri (macOS Docker Desktop, Linux containers without' \
+        '# GPU passthrough): use ANGLE + SwiftShader for an in-process' \
+        '# software GL backend. The pre-Chromium-109 --use-gl=swiftshader' \
+        '# is gone; modern syntax routes through ANGLE.' \
+        'if [ ! -e /dev/dri ]; then' \
+        '    flags="$flags --use-gl=angle --use-angle=swiftshader"' \
+        'fi' \
+        'exec /opt/cursor/AppRun $flags "$@"' \
         > /usr/local/bin/cursor; \
     chmod +x /usr/local/bin/cursor; \
     # Register cursor.desktop so the in-container Firefox can hand

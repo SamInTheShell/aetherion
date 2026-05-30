@@ -112,12 +112,17 @@ platforms:
 # accepted (forward-compat) but silently ignored by older launchers.
 defaults:
   display: x11
+  command: cursor       # bare `aetherion <ns>` runs cursor instead of bash
 ```
 
 The launcher recognizes these `defaults:` keys today:
 
 - `display`: `x11 | wayland | auto | none`. Sets the namespace's default
   display-forwarding mode at create time.
+- `command`: string (shlex-split into argv) or list of strings. Sets the
+  namespace's default command — what `aetherion NAMESPACE` runs when the
+  user doesn't pass a trailing command or `--command`. Falls through to
+  the image's `CMD` (bash for every baked-in template) when unset.
 
 Add a `template.yaml` whenever the template needs platform validation or
 sensible defaults; skip it for portable, defaults-free templates.

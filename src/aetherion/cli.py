@@ -8,9 +8,12 @@ import importlib.metadata
 import os
 import re
 import secrets
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -244,11 +247,56 @@ class NamespaceConfig:
     # CLI `--display` overrides; template `defaults.display` is the
     # initial value at namespace create time.
     display: str | None = None
+    # Default command argv for `aetherion NAMESPACE` (no trailing
+    # command). None ⇒ field absent in YAML; the launcher falls
+    # through to the image's CMD (bash for every baked-in template).
+    # CLI `--command` overrides; template `defaults.command` is the
+    # initial value at namespace create time. YAML accepts either a
+    # string (shlex-split into argv) or a list of strings (used
+    # verbatim); we always store as a list here.
+    command: list[str] | None = None
     env_from_map: dict[str, str] = field(default_factory=dict)
     env_from_file: dict[str, str] = field(default_factory=dict)
     env_from_env: dict[str, str] = field(default_factory=dict)
     port_forwarding: list[PortForward] = field(default_factory=list)
     volumes: list[str] = field(default_factory=list)
+
+
+def _parse_command_value(
+    raw: Any, *, context: str,
+) -> list[str] | None:
+    """Coerce a `command:` value (from template defaults, namespace
+    YAML, or `--command`) into an argv list.
+
+    Accepts a string (shlex-split — convenient for `command: cursor
+    --no-update`) or an explicit list of strings (used verbatim — the
+    way to spell argv whose elements contain whitespace). None / empty
+    string / empty list all mean "no command set" and return None so
+    the launcher falls through to the next resolution step.
+
+    `context` is included in error messages so the caller's source
+    (which file or which flag) makes it into the diagnostic."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            argv = shlex.split(raw)
+        except ValueError as e:
+            sys.stderr.write(
+                f"aetherion: {context}: `command` failed shlex parse: {e}\n"
+            )
+            raise SystemExit(1)
+        return argv or None
+    if isinstance(raw, list):
+        argv = [str(x) for x in raw]
+        return argv or None
+    sys.stderr.write(
+        f"aetherion: {context}: `command` must be a string or list of "
+        f"strings (got {type(raw).__name__})\n"
+    )
+    raise SystemExit(1)
 
 
 def _make_default_namespace_config(home: Path, name: str = DEFAULT_NAMESPACE) -> NamespaceConfig:
@@ -321,6 +369,11 @@ def load_config(home: Path) -> dict[str, NamespaceConfig]:
                 )
                 raise SystemExit(1)
 
+        command = _parse_command_value(
+            conf.get("command"),
+            context=f"{path}: namespace {name!r}",
+        )
+
         result[name] = NamespaceConfig(
             name=name,
             image=str(conf.get("image") or default_image_for(name)),
@@ -329,6 +382,7 @@ def load_config(home: Path) -> dict[str, NamespaceConfig]:
             ),
             template=template,
             display=display,
+            command=command,
             env_from_map=dict(env.get("fromMap") or {}),
             env_from_file=dict(env.get("fromFile") or {}),
             env_from_env=dict(env.get("fromEnv") or {}),
@@ -351,6 +405,10 @@ def save_config(home: Path, configs: dict[str, NamespaceConfig]) -> None:
             ns["template"] = c.template
         if c.display is not None:
             ns["display"] = c.display
+        if c.command is not None:
+            # Always persist as a list — round-trips cleanly even when
+            # the user originally wrote a string form in YAML.
+            ns["command"] = list(c.command)
         env_section: dict[str, Any] = {}
         if c.env_from_map:
             env_section["fromMap"] = dict(c.env_from_map)
@@ -758,6 +816,15 @@ def load_template_config(template_dir: Path) -> TemplateConfig:
                 f"{', '.join(sorted(DISPLAY_MODES))} (got {mode!r})\n"
             )
             raise SystemExit(1)
+    if "command" in defaults_raw:
+        # Validate at parse time so a broken template default fails
+        # loud at namespace-create time rather than silently dropping
+        # the field. Result discarded — we re-parse on apply so the
+        # defaults dict stays the raw shape templates wrote.
+        _parse_command_value(
+            defaults_raw["command"],
+            context=f"{path}: defaults.command",
+        )
 
     return TemplateConfig(
         description=description,
@@ -801,6 +868,11 @@ def _apply_template_defaults(
         mode = str(defaults["display"])
         if mode in DISPLAY_MODES:
             ns_config.display = mode
+    if "command" in defaults and ns_config.command is None:
+        ns_config.command = _parse_command_value(
+            defaults["command"],
+            context="template defaults.command",
+        )
 
 
 def _build_image(image: str, context: Path, *, no_cache: bool = False) -> int:
@@ -1880,6 +1952,9 @@ class LaunchOptions:
     image_override: str | None = None
     template: str | None = None
     display: str | None = None
+    # Raw `--command` value as the user typed it. Resolved to an argv
+    # list at launch via _parse_command_value. None ⇒ flag not given.
+    command_override: str | None = None
     env_overrides: list[str] = field(default_factory=list)
     forward_overrides: list[str] = field(default_factory=list)
     volume_overrides: list[str] = field(default_factory=list)
@@ -1898,6 +1973,7 @@ _LAUNCH_VALUE_FLAGS: dict[str, str] = {
     "--join": "join",
     "--template": "template",
     "--display": "display",
+    "--command": "command_override",
 }
 _LAUNCH_BOOL_FLAGS: frozenset[str] = frozenset({"--create"})
 _LAUNCH_OPTIONAL_VALUE_FLAGS: dict[str, str] = {
@@ -2003,10 +2079,25 @@ def _join_session(session: str, command: list[str]) -> int:
 
 
 def _resolve_display_mode(mode: str) -> str:
-    """Turn `auto` into the concrete mode it should bind to, based on
-    what's visible in the host env. Other values pass through unchanged."""
+    """Turn `auto` into the concrete mode it should bind to. Other
+    values pass through unchanged.
+
+    Linux hosts read $WAYLAND_DISPLAY / $DISPLAY directly and fall
+    through to `none` when neither is set — a reasonable default for
+    SSH sessions and other headless contexts.
+
+    macOS has exactly one display backend (XQuartz), so `auto` on
+    darwin collapses to `x11` unconditionally and lets the downstream
+    x11 path probe + halt with an install hint. Silently falling
+    through to `none` like Linux would just defer the failure to
+    "Missing X server or $DISPLAY" inside the container — actively
+    unhelpful when the user clearly wanted display (they passed
+    `auto`, not `none`). Users who actually want headless on macOS can
+    pass `--display none`."""
     if mode != "auto":
         return mode
+    if sys.platform == "darwin":
+        return "x11"
     if os.environ.get("WAYLAND_DISPLAY"):
         return "wayland"
     if os.environ.get("DISPLAY"):
@@ -2063,6 +2154,217 @@ def _add_dbus_args(
         ]
 
 
+def _xquartz_installed() -> bool:
+    """XQuartz drops both an app bundle and an /opt/X11 prefix on install.
+    Either being present is enough to say it's installed; we don't care
+    which channel (cask, .pkg, source) put it there."""
+    return (
+        Path("/Applications/Utilities/XQuartz.app").is_dir()
+        or Path("/opt/X11").is_dir()
+    )
+
+
+def _xquartz_listening() -> bool:
+    """Probe localhost:6000 — the well-known X11 display-0 TCP port — to
+    see if XQuartz (or something else) is actually accepting connections.
+    A short timeout keeps the launch path responsive when nothing's
+    there."""
+    try:
+        with socket.create_connection(("localhost", 6000), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _xquartz_ensure_ready() -> bool:
+    """Make XQuartz ready for the container: TCP listener enabled,
+    process running, localhost authorized via xhost. Returns True if
+    we end up in that state, False if any step failed (caller then
+    falls back to the manual hint).
+
+    Three things have to be true for the container to talk to XQuartz:
+      1. `org.xquartz.X11 nolisten_tcp` == false — the network listener
+         the Preferences → Security checkbox toggles.
+      2. XQuartz process is running so the listener actually binds.
+      3. `xhost +localhost` so XQuartz accepts the container's
+         connection (which originates from the VM's NAT address).
+
+    Each step is a one-line command, but failing any of them leaves
+    the user staring at "Missing X server" inside the container. Doing
+    them ourselves removes the entire macOS prerequisite checklist.
+
+    Idempotent: every step is a no-op when already in the target
+    state. Prints a one-line note for each step we actually take so
+    the user can see what changed."""
+    # Step 1 — pref. `defaults read` exits 0 with the value on stdout
+    # when set, nonzero when the key is absent (which means "use the
+    # XQuartz default", which is 1 / don't-listen).
+    pref = subprocess.run(
+        ["defaults", "read", "org.xquartz.X11", "nolisten_tcp"],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    nolisten = pref.stdout.strip() if pref.returncode == 0 else "1"
+
+    restart_needed = False
+    if nolisten != "0":
+        write = subprocess.run(
+            ["defaults", "write", "org.xquartz.X11",
+             "nolisten_tcp", "-bool", "false"],
+            capture_output=True, timeout=5, check=False,
+        )
+        if write.returncode != 0:
+            return False
+        sys.stderr.write(
+            "aetherion: enabled XQuartz TCP listener "
+            "(org.xquartz.X11 nolisten_tcp=false).\n"
+        )
+        restart_needed = True
+
+    # Step 2 — process. Pref changes only take effect on the next
+    # launch, so if we flipped it we have to restart; otherwise we only
+    # touch XQuartz if it isn't already listening.
+    if restart_needed or not _xquartz_listening():
+        if restart_needed:
+            sys.stderr.write("aetherion: restarting XQuartz…\n")
+            # Send Quit via AppleScript first (graceful — XQuartz can
+            # tear down clients cleanly). pkill is the brute fallback
+            # if osascript times out or the app ignores the event.
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "XQuartz" to quit'],
+                capture_output=True, timeout=10, check=False,
+            )
+            for _ in range(20):
+                time.sleep(0.25)
+                if not _xquartz_listening():
+                    break
+            else:
+                subprocess.run(
+                    ["pkill", "-x", "Xquartz"],
+                    capture_output=True, check=False,
+                )
+                time.sleep(0.5)
+        else:
+            sys.stderr.write("aetherion: launching XQuartz…\n")
+        subprocess.run(
+            ["open", "-a", "XQuartz"],
+            capture_output=True, timeout=10, check=False,
+        )
+        # XQuartz cold-start is a couple of seconds; give it up to ~10.
+        for _ in range(40):
+            time.sleep(0.25)
+            if _xquartz_listening():
+                break
+        else:
+            return False
+
+    # Step 3 — authorization. The container's connection comes in from
+    # the VM's NAT address, which xhost has to allow. `+localhost` is
+    # the wide-open form; narrower (per-IP) auth doesn't help since
+    # that NAT address changes each container start. Safe under
+    # "trusted single-user dev machine" assumptions, which match the
+    # rest of aetherion's threat model.
+    #
+    # xhost lives at /opt/X11/bin/xhost, which isn't always on PATH.
+    # DISPLAY=:0 routes the call through XQuartz's unix socket; the
+    # socket is owned by the calling user and doesn't itself need
+    # xhost auth.
+    xhost = shutil.which("xhost") or "/opt/X11/bin/xhost"
+    if Path(xhost).exists():
+        subprocess.run(
+            [xhost, "+localhost"],
+            capture_output=True, timeout=5, check=False,
+            env={**os.environ, "DISPLAY": ":0"},
+        )
+    return True
+
+
+def _display_runtime_args_darwin(
+    mode: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """macOS host (Docker Desktop / podman-machine). The container runs
+    inside a Linux VM, so the Linux host's display plumbing — the
+    /tmp/.X11-unix socket dir, $XAUTHORITY, the D-Bus buses, /dev/dri —
+    would all resolve against the VM, not macOS, if we tried to mount
+    them. Instead we point X11 at XQuartz running on the macOS host over
+    TCP via the well-known host.docker.internal alias.
+
+    Prereqs the user has to set up themselves, in this order: install
+    XQuartz, launch it with "Allow connections from network clients"
+    enabled (Preferences → Security; quit + relaunch for the listener
+    to actually bind), and `xhost +localhost` so XQuartz accepts the
+    connection from the VM. We probe for each here; missing prereqs
+    halt the launch with SystemExit(2) because `display: x11` is a
+    committed declaration that the namespace needs X11, and silently
+    dropping to no-display would just produce an opaque crash inside
+    the container (Cursor's "Missing X server or $DISPLAY" segfault).
+    Users who genuinely want headless can pass `--display none` to
+    override.
+
+    Note: the `auto` mode flows through _resolve_display_mode, which on
+    darwin only returns x11 when the prereqs are already satisfied —
+    so the halts below only fire when the user (or a template default)
+    explicitly committed to x11."""
+    if mode == "wayland":
+        sys.stderr.write(
+            "aetherion: display: wayland not supported on macOS hosts "
+            "(no Wayland compositor); skipping forwarding.\n"
+        )
+        return [], [], []
+    if mode != "x11":
+        return [], [], []
+
+    if not _xquartz_installed():
+        # No X server at all. This is the one prereq the launcher can't
+        # satisfy itself — Homebrew, App Store, and the .pkg installer
+        # all need user interaction. Lead with the brew one-liner;
+        # fall back to a brew.sh pointer when Homebrew isn't around.
+        sys.stderr.write(
+            "aetherion: display: x11 requires XQuartz on macOS, which "
+            "isn't installed.\n"
+        )
+        if shutil.which("brew") is not None:
+            sys.stderr.write(
+                "aetherion:   install:  brew install --cask xquartz\n"
+            )
+        else:
+            sys.stderr.write(
+                "aetherion:   install Homebrew first (https://brew.sh), "
+                "then:\n"
+                "aetherion:     brew install --cask xquartz\n"
+            )
+        sys.stderr.write(
+            "aetherion: refusing to launch without the X server "
+            "(pass --display none to override).\n"
+        )
+        raise SystemExit(2)
+
+    # Auto-configure XQuartz: enable the TCP listener, restart if
+    # needed, run `xhost +localhost`. Idempotent — silent when already
+    # in the right state.
+    if not _xquartz_ensure_ready():
+        # Auto-config bailed somewhere (osascript timeout, defaults
+        # write failed, listener never came up). Fall back to the
+        # manual hint and halt.
+        sys.stderr.write(
+            "aetherion: display: x11 — couldn't auto-configure XQuartz. "
+            "Try manually:\n"
+            "aetherion:   - XQuartz menu → Preferences → Security → "
+            "\"Allow connections from\n"
+            "aetherion:     network clients\", then quit + relaunch "
+            "XQuartz.\n"
+            "aetherion:   - In a macOS terminal: `xhost +localhost`.\n"
+            "aetherion:   - Verify: `lsof -iTCP:6000 -sTCP:LISTEN` "
+            "should show XQuartz.\n"
+            "aetherion: refusing to launch without the X server "
+            "(pass --display none to override).\n"
+        )
+        raise SystemExit(2)
+
+    env = ["-e", "DISPLAY=host.docker.internal:0"]
+    return [], env, []
+
+
 def _display_runtime_args(mode: str) -> tuple[list[str], list[str], list[str]]:
     """For a resolved display mode (x11/wayland/none — never `auto`),
     return the `-v`, `-e`, and extra runtime args to inject. Empty lists
@@ -2074,6 +2376,8 @@ def _display_runtime_args(mode: str) -> tuple[list[str], list[str], list[str]]:
     Cursor sign-in flow silently no-op."""
     if mode == "none":
         return [], [], []
+    if sys.platform == "darwin":
+        return _display_runtime_args_darwin(mode)
 
     volumes: list[str] = []
     env_dict: dict[str, str] = {}
@@ -2398,6 +2702,26 @@ def cmd_launch(
         "--label", f"{LABEL_WORKDIR}={container_workdir}",
     ]
 
+    # Command resolution order:
+    #   1. Positional trailing command after NAMESPACE (`aetherion
+    #      cursor-ide bash` → bash). Existing behavior; explicit always
+    #      wins.
+    #   2. CLI `--command FOO` (shlex-split into argv).
+    #   3. Namespace config `command:` (set by hand, or written from
+    #      the source template's `defaults.command` at create time).
+    #   4. Empty argv ⇒ defer to the image's CMD (bash for every
+    #      baked-in template).
+    final_command: list[str] = list(command)
+    if not final_command and options.command_override is not None:
+        parsed = _parse_command_value(
+            options.command_override,
+            context="--command",
+        )
+        if parsed:
+            final_command = parsed
+    if not final_command and config.command is not None:
+        final_command = list(config.command)
+
     # The namespace mount lands first; configured volumes layer on, and
     # the workdir mount (always a subpath of CONTAINER_HOME for host
     # paths under $HOME) wins for its subtree.
@@ -2420,7 +2744,7 @@ def cmd_launch(
         "-w", container_workdir,
         "-it",
         image,
-        *command,
+        *final_command,
     ]
 
     return subprocess.run(run_argv).returncode
@@ -2434,14 +2758,15 @@ def _print_help() -> None:
         "\n"
         "Launch:\n"
         "  aetherion                                       # launch the default namespace\n"
-        "  aetherion NAMESPACE                             # launch into NAMESPACE\n"
-        "  aetherion NAMESPACE COMMAND [ARG...]            # run COMMAND instead of an interactive shell\n"
+        "  aetherion NAMESPACE                             # launch into NAMESPACE (runs namespace's `command` or bash)\n"
+        "  aetherion NAMESPACE COMMAND [ARG...]            # run COMMAND instead (positional override)\n"
         "  aetherion NAMESPACE --create [--template SPEC]  # create NAMESPACE if missing, then launch\n"
         "  aetherion NAMESPACE --join SESSION [CMD]        # exec into a running session\n"
         "\n"
         "Launch flag overrides (additive on top of the YAML config):\n"
         "  --image REF                                # use a different image for this launch\n"
         "  --display x11|wayland|auto|none            # override display forwarding for this launch\n"
+        "  --command \"CMD [ARG...]\"                   # override the namespace's default command (shlex-split)\n"
         "  -e, --env NAME=VALUE                       # add an env var (repeatable)\n"
         "  --forward [ADDR:[HOST_PORT:]]CONTAINER_PORT  # publish a port (repeatable)\n"
         "  -v, --volume SRC[:DST]                     # mount a host path (repeatable)\n"
