@@ -1,0 +1,44 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Cursor IDE (Electron, native amd64/arm64) with X11 forwarding."
+
+# Native on both architectures: Cursor ships linux-x64 and linux-arm64
+# AppImages, and the Dockerfile selects the matching one at build time.
+# No emulation required on either side.
+#
+# macOS hosts (Docker Desktop / podman-machine) run the container inside
+# a Linux VM. Display forwarding works via XQuartz over TCP — the
+# launcher's darwin display path sets DISPLAY=host.docker.internal:0
+# and skips the Linux-only socket/D-Bus/GPU plumbing. The launcher
+# auto-configures XQuartz on each `--display x11` (or `auto`) launch:
+# flips `org.xquartz.X11 nolisten_tcp` to false, restarts XQuartz if
+# it had to change the pref, waits for the server to actually answer
+# X11, then disables access control with `xhost +` (the container
+# connects from the VM's NAT address, which a per-host grant like
+# `+localhost` can't cover). The only
+# manual step is `brew install --cask xquartz`; missing-XQuartz halts
+# the launch with that hint. The cursor wrapper picks up `/dev/dri`
+# absence at runtime and adds `--use-gl=angle --use-angle=swiftshader`
+# so Chromium's renderer survives the no-GPU XQuartz path.
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+
+# Per-namespace defaults applied at `create namespace` time. The launcher
+# writes these into the new namespace's config.yaml entry; explicit CLI
+# values still win.
+defaults:
+  display: x11
+  # Bare `aetherion cursor-ide` opens Cursor on the launch directory
+  # (`.` = the mounted workdir; the launcher sets the container's `-w`
+  # to your project dir, and `command:` is shlex-split with no env
+  # expansion, so `.` works where `${PWD}` would not). Drop to a shell
+  # with `aetherion cursor-ide bash` (positional override) or
+  # `aetherion cursor-ide --command bash` (explicit flag).
+  command: cursor .

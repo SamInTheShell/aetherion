@@ -1,0 +1,27 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Language toolchain + Neovim 0.11.7 + full LSP/DAP stack (lua-ls, rust-analyzer, codelldb, js-debug, debugpy, gopls, dlv, tsserver, pyright)."
+
+# Native on both architectures: nvim ships a glibc-linked tarball per
+# arch; rust-analyzer, codelldb, lua-ls have prebuilt per-arch
+# binaries; everything else is arch-agnostic or built from source via
+# the apt toolchain. Runs on darwin too — Docker Desktop /
+# podman-machine host the Linux container inside their VM.
+platforms:
+  - { os: linux,  arch: amd64, runtime: podman }
+  - { os: linux,  arch: amd64, runtime: docker }
+  - { os: linux,  arch: arm64, runtime: podman }
+  - { os: linux,  arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
+
+# Per-namespace defaults applied at `create namespace` time. The
+# launcher writes these into the new namespace's config.yaml entry;
+# explicit CLI values still win.
+defaults:
+  # Bare `aetherion <ns>` lands you in nvim, not bash. Drop to a shell
+  # with `aetherion <ns> bash` (positional override) or
+  # `aetherion <ns> --command bash` (explicit flag).
+  command: nvim

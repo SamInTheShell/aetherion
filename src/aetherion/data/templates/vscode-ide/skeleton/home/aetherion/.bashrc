@@ -1,10 +1,10 @@
-# ~/.bashrc — aetherion dev container
+# ~/.bashrc — aetherion vscode-ide template
 #
-# Sourced for interactive shells. /etc/skel/.profile (still in place from
-# useradd) handles the login-shell -> .bashrc handoff, so a `bash -l` startup
-# lands here too.
+# Minimal stub; mirrors the conventions in
+# src/aetherion/data/templates/STYLE.md so the prompt + Ctrl-W feel match
+# the `default` template even though this image ships almost nothing else.
 
-# Interactive guard — non-interactive shells bail out before doing any setup.
+# Interactive guard — non-interactive shells bail before any setup.
 case $- in
     *i*) ;;
       *) return;;
@@ -26,10 +26,6 @@ if ! shopt -oq posix; then
     fi
 fi
 
-# ---- add bun bin to path ------------------------------------------------
-export PATH="${PATH}:/home/aetherion/.bun/bin"
-export PATH="${PATH}:/opt/node/bin"
-
 # ---- readline: make Ctrl-W match Alt-B's word boundaries ----------------
 # Two pieces are required, because two layers race for Ctrl-W:
 #   1. termios WERASE (kernel-level, whitespace-only) — disabled here so
@@ -41,9 +37,7 @@ export PATH="${PATH}:/opt/node/bin"
 stty werase undef 2>/dev/null
 bind '"\C-w": backward-kill-word'
 
-# ---- convenience aliases ------------------------------------------------
-alias cursor='cursor-agent' # Doubtful this container will have Cursor IDE
-
 # ---- starship prompt ----------------------------------------------------
-# Config lives at ~/.config/starship.toml (catppuccin_mocha, see that file).
+# Config lives at ~/.config/starship.toml (shared with the `default`
+# template). Required by the baked-in template style guide.
 eval "$(starship init bash)"

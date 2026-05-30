@@ -3,13 +3,18 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import importlib.metadata
 import os
 import re
 import secrets
+import shlex
 import shutil
+import socket
+import struct
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,19 +24,24 @@ import yaml
 CONTAINER_HOME = "/home/aetherion"
 IMAGE_PREFIX = "localhost/aetherion"
 DEFAULT_NAMESPACE = "default"
+DEFAULT_TEMPLATE = "default"
 
 # Host-side layout, all under ~/.aetherion/:
 #   config.yaml            — namespace registry (this file's source of truth)
 #   namespaces/<name>/     — bind-mounted as $HOME inside the container
-#   containers/<name>/     — build context (Dockerfile + skeleton + aetherion-src)
+#   containers/<name>/     — per-namespace build context (forked from a template)
+#   templates/<name>/      — user-defined templates (shadow baked-in by name)
+#   template-cache/<hash>/ — git-cloned template sources, keyed by URL hash
 CONFIG_FILENAME = "config.yaml"
 NAMESPACES_DIRNAME = "namespaces"
 CONTAINERS_DIRNAME = "containers"
+TEMPLATES_DIRNAME = "templates"
+TEMPLATE_CACHE_DIRNAME = "template-cache"
 
 # The first positional after `aetherion` is either one of these verbs or
 # a namespace name. Reserved words can't be used as namespace names so the
 # dispatch is never ambiguous.
-VERBS = ("config", "list", "create", "reset", "rebuild", "delete")
+VERBS = ("config", "list", "create", "edit", "reset", "rebuild", "delete")
 RESERVED_NAMESPACE_NAMES = frozenset(VERBS)
 
 # Per-namespace state inside its $HOME — records which image digest this
@@ -59,10 +69,14 @@ OPENCLAW_GATEWAY_PORT = 18789
 # 127.0.0.1:service_port internally.
 BRIDGE_PORT_OFFSET = 40000
 
-BUNDLED_ASSETS: tuple[str, ...] = ("Dockerfile", "skeleton", "aetherion-src")
+# A template directory holds these entries; `_populate_build_dir` copies
+# them into a namespace's build dir (and the dev-mode overlay replaces
+# aetherion-src/ when running from a source checkout).
+TEMPLATE_ENTRIES: tuple[str, ...] = ("Dockerfile", "skeleton", "aetherion-src")
 
 # Letters, digits, dot, underscore, dash; no leading dot. Anything else is
 # a path-traversal or shell-surprise risk in ~/.aetherion/namespaces/.
+# Reused for template names — same safety rules apply.
 _NAMESPACE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 
 
@@ -168,6 +182,33 @@ def _namespace_build_dir(home: Path, name: str) -> Path:
     return _containers_dir(home) / name
 
 
+def _user_templates_dir(home: Path) -> Path:
+    return _aetherion_dir(home) / TEMPLATES_DIRNAME
+
+
+def _user_template_dir(home: Path, name: str) -> Path:
+    return _user_templates_dir(home) / name
+
+
+def _bundled_templates_dir() -> Path:
+    return _bundled_assets_dir() / TEMPLATES_DIRNAME
+
+
+def _bundled_template_dir(name: str) -> Path:
+    return _bundled_templates_dir() / name
+
+
+def _template_cache_dir(home: Path) -> Path:
+    return _aetherion_dir(home) / TEMPLATE_CACHE_DIRNAME
+
+
+def _cache_dir_for_url(home: Path, url: str) -> Path:
+    # 16 hex chars = 64 bits of namespace; collisions on a single user's
+    # template list are vanishingly unlikely and the human-facing key is
+    # the URL the user typed, not this hash.
+    return _template_cache_dir(home) / hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
 def default_image_for(namespace: str) -> str:
     return f"{IMAGE_PREFIX}:{namespace}"
 
@@ -196,6 +237,25 @@ class NamespaceConfig:
     name: str
     image: str
     build_dir: Path
+    # The template spec the buildDir was forked from, recorded at create
+    # time. Either a local template name (e.g. "default") or a git URL
+    # with an optional `#ref` suffix. Informational for `list namespaces`;
+    # `rebuild namespace … --refresh-template` re-resolves this. None for
+    # legacy namespaces created before templates were tracked.
+    template: str | None = None
+    # Display forwarding mode: x11 | wayland | auto | none. None ⇒ field
+    # absent in YAML; resolved to the built-in default ("none") at launch.
+    # CLI `--display` overrides; template `defaults.display` is the
+    # initial value at namespace create time.
+    display: str | None = None
+    # Default command argv for `aetherion NAMESPACE` (no trailing
+    # command). None ⇒ field absent in YAML; the launcher falls
+    # through to the image's CMD (bash for every baked-in template).
+    # CLI `--command` overrides; template `defaults.command` is the
+    # initial value at namespace create time. YAML accepts either a
+    # string (shlex-split into argv) or a list of strings (used
+    # verbatim); we always store as a list here.
+    command: list[str] | None = None
     env_from_map: dict[str, str] = field(default_factory=dict)
     env_from_file: dict[str, str] = field(default_factory=dict)
     env_from_env: dict[str, str] = field(default_factory=dict)
@@ -203,11 +263,49 @@ class NamespaceConfig:
     volumes: list[str] = field(default_factory=list)
 
 
+def _parse_command_value(
+    raw: Any, *, context: str,
+) -> list[str] | None:
+    """Coerce a `command:` value (from template defaults, namespace
+    YAML, or `--command`) into an argv list.
+
+    Accepts a string (shlex-split — convenient for `command: cursor
+    --no-update`) or an explicit list of strings (used verbatim — the
+    way to spell argv whose elements contain whitespace). None / empty
+    string / empty list all mean "no command set" and return None so
+    the launcher falls through to the next resolution step.
+
+    `context` is included in error messages so the caller's source
+    (which file or which flag) makes it into the diagnostic."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            argv = shlex.split(raw)
+        except ValueError as e:
+            sys.stderr.write(
+                f"aetherion: {context}: `command` failed shlex parse: {e}\n"
+            )
+            raise SystemExit(1)
+        return argv or None
+    if isinstance(raw, list):
+        argv = [str(x) for x in raw]
+        return argv or None
+    sys.stderr.write(
+        f"aetherion: {context}: `command` must be a string or list of "
+        f"strings (got {type(raw).__name__})\n"
+    )
+    raise SystemExit(1)
+
+
 def _make_default_namespace_config(home: Path, name: str = DEFAULT_NAMESPACE) -> NamespaceConfig:
     return NamespaceConfig(
         name=name,
         image=default_image_for(name),
         build_dir=_namespace_build_dir(home, name),
+        template=DEFAULT_TEMPLATE,
     )
 
 
@@ -256,12 +354,36 @@ def load_config(home: Path) -> dict[str, NamespaceConfig]:
                 )
             )
 
+        template_raw = conf.get("template")
+        template = str(template_raw) if template_raw is not None else None
+
+        display_raw = conf.get("display")
+        if display_raw is None:
+            display = None
+        else:
+            display = str(display_raw)
+            if display not in DISPLAY_MODES:
+                sys.stderr.write(
+                    f"aetherion: {path}: namespace {name!r} has invalid "
+                    f"`display` value {display!r}; must be one of "
+                    f"{', '.join(sorted(DISPLAY_MODES))}.\n"
+                )
+                raise SystemExit(1)
+
+        command = _parse_command_value(
+            conf.get("command"),
+            context=f"{path}: namespace {name!r}",
+        )
+
         result[name] = NamespaceConfig(
             name=name,
             image=str(conf.get("image") or default_image_for(name)),
             build_dir=_expand(
                 conf.get("buildDir") or _namespace_build_dir(home, name)
             ),
+            template=template,
+            display=display,
+            command=command,
             env_from_map=dict(env.get("fromMap") or {}),
             env_from_file=dict(env.get("fromFile") or {}),
             env_from_env=dict(env.get("fromEnv") or {}),
@@ -280,6 +402,14 @@ def save_config(home: Path, configs: dict[str, NamespaceConfig]) -> None:
             "image": c.image,
             "buildDir": _short_home_path(home, c.build_dir),
         }
+        if c.template is not None:
+            ns["template"] = c.template
+        if c.display is not None:
+            ns["display"] = c.display
+        if c.command is not None:
+            # Always persist as a list — round-trips cleanly even when
+            # the user originally wrote a string form in YAML.
+            ns["command"] = list(c.command)
         env_section: dict[str, Any] = {}
         if c.env_from_map:
             env_section["fromMap"] = dict(c.env_from_map)
@@ -369,25 +499,29 @@ def _overlay_repo_source(overlay: Path, repo: Path) -> None:
     )
 
 
-def _populate_build_dir(dest: Path, *, fresh: bool) -> None:
-    """Populate `dest` with the bundled Dockerfile, skeleton, and
+def _populate_build_dir(dest: Path, source: Path, *, fresh: bool) -> None:
+    """Populate `dest` with the template's Dockerfile, skeleton, and
     aetherion-src placeholder.
 
-    `fresh=True` (used by `create namespace`): the dest is assumed to be
-    empty or absent; everything is copied in. With a source checkout,
-    aetherion-src/ is overlaid with the live repo so the first build picks
-    up local edits.
+    `source` is the resolved template directory (either a user-defined
+    one under ~/.aetherion/templates/, the package's baked-in
+    data/templates/<name>/, or a git-cache clone).
+
+    `fresh=True` (used by `create namespace` and template re-forks): the
+    dest is assumed to be empty or absent; everything is copied in. With
+    a source checkout, aetherion-src/ is overlaid with the live repo so
+    the first build picks up local edits.
 
     `fresh=False` (used by `rebuild namespace`): the user may have edited
-    Dockerfile/skeleton, so we leave those alone. The aetherion-src/ overlay
-    is still refreshed in dev mode so the launcher's latest source flows
-    into the next build without forcing the user to re-create the namespace.
+    Dockerfile/skeleton in the buildDir, so we leave those alone. The
+    aetherion-src/ overlay is still refreshed in dev mode so the launcher's
+    latest source flows into the next build without forcing the user to
+    re-create the namespace.
     """
-    bundle = _bundled_assets_dir()
     dest.mkdir(parents=True, exist_ok=True)
 
     for name in ("Dockerfile", "skeleton"):
-        src, dst = bundle / name, dest / name
+        src, dst = source / name, dest / name
         if not fresh and dst.exists():
             continue
         if src.is_dir():
@@ -403,12 +537,343 @@ def _populate_build_dir(dest: Path, *, fresh: bool) -> None:
             f"aetherion: dev mode — overlaid repo source from {repo} "
             f"into {overlay}\n"
         )
-    elif not overlay.exists():
-        # No checkout, fresh setup: copy the bundled placeholder so the
-        # Dockerfile's COPY succeeds with a no-op tree.
-        src = bundle / "aetherion-src"
+    elif fresh or not overlay.exists():
+        # No checkout: copy the template's aetherion-src/ placeholder so
+        # the Dockerfile's COPY succeeds. Skipped on non-fresh populates
+        # when an overlay already exists (preserves user edits).
+        src = source / "aetherion-src"
         if src.is_dir():
-            shutil.copytree(src, overlay)
+            if overlay.exists() and fresh:
+                _rmtree_any(overlay)
+            if not overlay.exists():
+                shutil.copytree(src, overlay)
+
+
+# Template resolution -------------------------------------------------------
+
+@dataclass
+class TemplateSource:
+    """A resolved template ready to read files from. `display_name` is
+    what we record in the namespace's config.template (a local name like
+    `default`, or a git URL like `https://x.git#v1.0`)."""
+    path: Path
+    display_name: str
+
+
+def _validate_template_name(name: str) -> str | None:
+    """Validate a local template name (same character rules as namespaces;
+    no reserved-word check because template names never appear in a verb
+    dispatch slot)."""
+    if not _NAMESPACE_NAME_RE.fullmatch(name):
+        return (
+            f"invalid template name {name!r}: use letters, digits, dot, "
+            "underscore, dash; no leading dot."
+        )
+    return None
+
+
+def _looks_like_git_url(spec: str) -> bool:
+    """Best-effort detection. Two shapes are common in practice:
+    `scheme://...` (https, git, ssh) and `user@host:path` (the SSH form
+    git itself accepts). Anything else is treated as a local template
+    name."""
+    if "://" in spec:
+        return True
+    if re.match(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:", spec):
+        return True
+    return False
+
+
+def _split_url_ref(spec: str) -> tuple[str, str | None]:
+    """Split `URL#REF` into (URL, REF). `#` is used (not `@`) because
+    `git@host:` SSH URLs already contain an @ that would be ambiguous."""
+    if "#" in spec:
+        url, _, ref = spec.rpartition("#")
+        return url, (ref or None)
+    return spec, None
+
+
+def _ensure_git_template(home: Path, url: str, ref: str | None) -> Path:
+    """Clone or refresh the git repo into the per-URL cache and check
+    out the requested ref. Returns the cache path."""
+    cache = _cache_dir_for_url(home, url)
+    if not cache.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr.write(f"aetherion: cloning {url} into {cache}\n")
+        rc = subprocess.run(["git", "clone", url, str(cache)]).returncode
+        if rc != 0:
+            raise RuntimeError(f"git clone failed for {url}")
+    else:
+        sys.stderr.write(f"aetherion: fetching updates for {url}\n")
+        rc = subprocess.run(
+            ["git", "-C", str(cache), "fetch", "--all", "--tags", "--force",
+             "--prune"],
+        ).returncode
+        if rc != 0:
+            sys.stderr.write(
+                f"aetherion: warning: git fetch failed for {url}; "
+                "using cached state.\n"
+            )
+
+    if ref is not None:
+        rc = subprocess.run(
+            ["git", "-C", str(cache), "checkout", "--detach", ref],
+        ).returncode
+        if rc != 0:
+            raise RuntimeError(f"git checkout {ref!r} failed in {cache}")
+    else:
+        # Fast-forward the cache's currently checked-out branch when no
+        # explicit ref was given. Best-effort: if the worktree is detached
+        # or the upstream is gone, leave it.
+        subprocess.run(
+            ["git", "-C", str(cache), "pull", "--ff-only"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    return cache
+
+
+def _resolve_template_source(home: Path, spec: str) -> TemplateSource:
+    """Resolve a `--template VALUE`-style spec to a directory we can copy
+    from. Local names check the user dir first, then the baked-in dir.
+    URLs hit the cache (cloned/updated)."""
+    if _looks_like_git_url(spec):
+        url, ref = _split_url_ref(spec)
+        cache = _ensure_git_template(home, url, ref)
+        return TemplateSource(path=cache, display_name=spec)
+
+    err = _validate_template_name(spec)
+    if err:
+        raise ValueError(err)
+    user = _user_template_dir(home, spec)
+    if user.is_dir():
+        return TemplateSource(path=user, display_name=spec)
+    bundled = _bundled_template_dir(spec)
+    if bundled.is_dir():
+        return TemplateSource(path=bundled, display_name=spec)
+    available = sorted(_known_template_names(home))
+    raise ValueError(
+        f"no such template {spec!r}; available: "
+        f"{', '.join(available) if available else '(none)'}"
+    )
+
+
+def _known_template_names(home: Path) -> set[str]:
+    """Union of user-defined and baked-in template names."""
+    names: set[str] = set()
+    user_root = _user_templates_dir(home)
+    if user_root.is_dir():
+        for p in user_root.iterdir():
+            if p.is_dir():
+                names.add(p.name)
+    bundled = _bundled_templates_dir()
+    if bundled.is_dir():
+        for p in bundled.iterdir():
+            if p.is_dir():
+                names.add(p.name)
+    return names
+
+
+def _template_sources_for(home: Path, name: str) -> tuple[Path | None, Path | None]:
+    """Returns (user_path_or_None, bundled_path_or_None). Either can be
+    None if that source doesn't have the template."""
+    user = _user_template_dir(home, name)
+    bundled = _bundled_template_dir(name)
+    return (user if user.is_dir() else None,
+            bundled if bundled.is_dir() else None)
+
+
+# Per-template metadata (template.yaml) ------------------------------------
+
+TEMPLATE_CONFIG_FILENAME = "template.yaml"
+
+# Recognized display modes for namespaces. None of the YAML / CLI / template
+# layers is forced to pick one of these; they're validated centrally so
+# unknown values fail loud rather than silently no-op.
+DISPLAY_MODES: frozenset[str] = frozenset({"x11", "wayland", "auto", "none"})
+
+
+@dataclass
+class PlatformSpec:
+    """One supported-host tuple from a template's `platforms:` list.
+    Any field may be `*` to wildcard it."""
+    os: str
+    arch: str
+    runtime: str
+
+    def matches(self, host: "HostPlatform") -> bool:
+        return (
+            (self.os == "*" or self.os == host.os)
+            and (self.arch == "*" or self.arch == host.arch)
+            and (self.runtime == "*" or self.runtime == host.runtime)
+        )
+
+    def __str__(self) -> str:
+        return f"{self.os}/{self.arch}/{self.runtime}"
+
+
+@dataclass
+class HostPlatform:
+    os: str
+    arch: str
+    runtime: str
+
+    def __str__(self) -> str:
+        return f"{self.os}/{self.arch}/{self.runtime}"
+
+
+@dataclass
+class TemplateConfig:
+    """Parsed template.yaml. All fields are optional; templates without a
+    template.yaml end up with an instance whose every field is None / [] /
+    {} (i.e., universally portable, no defaults, no description)."""
+    description: str | None = None
+    platforms: list[PlatformSpec] | None = None  # None ⇒ skip validation
+    defaults: dict[str, Any] = field(default_factory=dict)
+
+
+def _detect_host_platform() -> HostPlatform:
+    """Best-effort host detection. arch is normalized to amd64/arm64 so it
+    matches the values templates would naturally write."""
+    sys_name = sys.platform  # 'linux', 'darwin', ...
+    host_os = "linux" if sys_name.startswith("linux") else (
+        "darwin" if sys_name == "darwin" else sys_name
+    )
+
+    raw_arch = os.uname().machine.lower()
+    arch_map = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+    host_arch = arch_map.get(raw_arch, raw_arch)
+
+    # CONTAINER_RUNTIME may be an absolute path on some hosts; the
+    # template-side declaration uses the basename.
+    runtime = Path(CONTAINER_RUNTIME).name
+
+    return HostPlatform(os=host_os, arch=host_arch, runtime=runtime)
+
+
+def _template_config_path(template_dir: Path) -> Path:
+    return template_dir / TEMPLATE_CONFIG_FILENAME
+
+
+def load_template_config(template_dir: Path) -> TemplateConfig:
+    """Read `<template_dir>/template.yaml` if present. Missing file is
+    treated as 'no metadata' (universally portable, no defaults). Malformed
+    files SystemExit with a pointer at what went wrong."""
+    path = _template_config_path(template_dir)
+    if not path.is_file():
+        return TemplateConfig()
+    try:
+        with path.open("r") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        sys.stderr.write(f"aetherion: failed to parse {path}: {e}\n")
+        raise SystemExit(1)
+    if not isinstance(data, dict):
+        sys.stderr.write(f"aetherion: {path}: top-level must be a mapping\n")
+        raise SystemExit(1)
+
+    description = data.get("description")
+    if description is not None and not isinstance(description, str):
+        sys.stderr.write(f"aetherion: {path}: `description` must be a string\n")
+        raise SystemExit(1)
+
+    platforms_raw = data.get("platforms")
+    platforms: list[PlatformSpec] | None
+    if platforms_raw is None:
+        platforms = None
+    elif isinstance(platforms_raw, list):
+        platforms = []
+        for entry in platforms_raw:
+            if not isinstance(entry, dict):
+                sys.stderr.write(
+                    f"aetherion: {path}: each `platforms` entry must be a "
+                    f"mapping (got {entry!r})\n"
+                )
+                raise SystemExit(1)
+            platforms.append(PlatformSpec(
+                os=str(entry.get("os") or "*"),
+                arch=str(entry.get("arch") or "*"),
+                runtime=str(entry.get("runtime") or "*"),
+            ))
+    else:
+        sys.stderr.write(f"aetherion: {path}: `platforms` must be a list\n")
+        raise SystemExit(1)
+
+    defaults_raw = data.get("defaults") or {}
+    if not isinstance(defaults_raw, dict):
+        sys.stderr.write(f"aetherion: {path}: `defaults` must be a mapping\n")
+        raise SystemExit(1)
+    # Validate any defaults we recognize; unknown keys are accepted (forward
+    # compatibility with templates ahead of the launcher).
+    if "display" in defaults_raw:
+        mode = str(defaults_raw["display"])
+        if mode not in DISPLAY_MODES:
+            sys.stderr.write(
+                f"aetherion: {path}: defaults.display must be one of "
+                f"{', '.join(sorted(DISPLAY_MODES))} (got {mode!r})\n"
+            )
+            raise SystemExit(1)
+    if "command" in defaults_raw:
+        # Validate at parse time so a broken template default fails
+        # loud at namespace-create time rather than silently dropping
+        # the field. Result discarded — we re-parse on apply so the
+        # defaults dict stays the raw shape templates wrote.
+        _parse_command_value(
+            defaults_raw["command"],
+            context=f"{path}: defaults.command",
+        )
+
+    return TemplateConfig(
+        description=description,
+        platforms=platforms,
+        defaults=dict(defaults_raw),
+    )
+
+
+def _check_template_platform(
+    template_name: str,
+    config: TemplateConfig,
+    host: HostPlatform,
+) -> str | None:
+    """Returns None when supported, otherwise an error string ready to
+    show to the user. Templates with no `platforms:` field skip the check."""
+    if config.platforms is None:
+        return None
+    for spec in config.platforms:
+        if spec.matches(host):
+            return None
+    supported = ", ".join(str(p) for p in config.platforms) or "(none declared)"
+    return (
+        f"template {template_name!r} does not support this host "
+        f"({host}). Supported: {supported}."
+    )
+
+
+def _apply_template_defaults(
+    ns_config: NamespaceConfig,
+    defaults: dict[str, Any],
+) -> None:
+    """Merge a template's `defaults:` block into a fresh NamespaceConfig
+    that's about to be saved. Only fields the launcher knows about get
+    applied — unknown keys are accepted in the YAML (forward-compat with
+    templates ahead of the launcher) but silently ignored here.
+
+    Caller is responsible for letting explicit user values win; this
+    helper assumes ns_config is the freshly-defaulted scaffold so any
+    template default it sets is wanted."""
+    if "display" in defaults and ns_config.display is None:
+        mode = str(defaults["display"])
+        if mode in DISPLAY_MODES:
+            ns_config.display = mode
+    if "command" in defaults and ns_config.command is None:
+        ns_config.command = _parse_command_value(
+            defaults["command"],
+            context="template defaults.command",
+        )
 
 
 def _build_image(image: str, context: Path, *, no_cache: bool = False) -> int:
@@ -571,7 +1036,17 @@ def _has_real_content(path: Path) -> bool:
 def _rmtree_any(path: Path) -> None:
     """Remove path whether it's a file, symlink, or directory. No-op if
     absent. Pre-walks and grants owner-write on every directory so cleanup
-    succeeds even on Go's 0555 module-cache dirs."""
+    succeeds even on Go's 0555 module-cache dirs.
+
+    Rootless podman creates bind-mount targets inside the user namespace,
+    so any stub it creates ends up owned by subuid-root on the host —
+    `shutil.rmtree` then fails with PermissionError because our normal UID
+    can't unlink them. We fall back to `<runtime> unshare`, which
+    re-enters the userns (no sudo required) where the same files appear
+    as our normal UID and a vanilla `rm -rf` can do its thing. The
+    fallback only kicks in for rootless podman; docker (which runs
+    `--user 1000:1000` end-to-end) and rootful runtimes either won't hit
+    the problem or have plain rm available."""
     if path.is_symlink() or path.is_file():
         path.unlink()
         return
@@ -582,7 +1057,30 @@ def _rmtree_any(path: Path) -> None:
             os.chmod(root, 0o700)
         except OSError:
             pass
-    shutil.rmtree(path)
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        if _RUNTIME_IS_DOCKER or os.geteuid() == 0:
+            raise
+        sys.stderr.write(
+            f"aetherion: subuid-owned files under {path}; retrying via "
+            f"`{CONTAINER_RUNTIME} unshare rm -rf` (no sudo required).\n"
+        )
+        r = subprocess.run([
+            CONTAINER_RUNTIME, "unshare",
+            "sh", "-c",
+            # chmod first so 0555 dirs (Go module cache) inside the userns
+            # become writable; both steps run inside the userns so subuid
+            # ownership is transparent to them.
+            'chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"',
+            "sh", str(path),
+        ])
+        if r.returncode != 0 or path.exists():
+            sys.stderr.write(
+                f"aetherion: `{CONTAINER_RUNTIME} unshare` cleanup of "
+                f"{path} failed. You may need to remove it manually.\n"
+            )
+            raise
 
 
 def _bridge_port_for(service_port: int) -> int:
@@ -710,14 +1208,23 @@ def cmd_list(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="aetherion list")
     parser.add_argument(
         "what",
-        choices=("namespace", "namespaces", "session", "sessions"),
-        help="`namespaces` (registered namespaces) or `sessions` (running containers).",
+        choices=(
+            "namespace", "namespaces",
+            "session", "sessions",
+            "template", "templates",
+        ),
+        help=(
+            "`namespaces` (registered), `sessions` (running containers), "
+            "or `templates` (baked-in + user-defined)."
+        ),
     )
     args = parser.parse_args(argv)
 
     home = Path.home()
     if args.what in ("namespace", "namespaces"):
         return _list_namespaces(home)
+    if args.what in ("template", "templates"):
+        return _list_templates(home)
     return _list_sessions()
 
 
@@ -761,10 +1268,48 @@ def _list_namespaces(home: Path) -> int:
             seed = seed[:19] + "..." if len(seed) > 22 else seed
         else:
             seed = "(not seeded)"
-        image = configs[name].image if name in configs else "(unregistered)"
-        rows.append((name, image, seed))
+        if name in configs:
+            cfg = configs[name]
+            image = cfg.image
+            template = cfg.template or "(unknown)"
+        else:
+            image = "(unregistered)"
+            template = "(unknown)"
+        rows.append((name, image, template, seed))
 
-    _print_table(("NAMESPACE", "IMAGE", "SEEDED FROM"), rows)
+    _print_table(("NAMESPACE", "IMAGE", "TEMPLATE", "SEEDED FROM"), rows)
+    return 0
+
+
+def _list_templates(home: Path) -> int:
+    names = sorted(_known_template_names(home))
+    if not names:
+        # This shouldn't happen — the bundled default ships with the
+        # package — but bail gracefully if the package data is missing.
+        sys.stderr.write("aetherion: no templates available.\n")
+        return 0
+
+    rows: list[tuple[str, ...]] = []
+    for name in names:
+        user, bundled = _template_sources_for(home, name)
+        if user is not None and bundled is not None:
+            active, shadowed = "user", "baked-in"
+            active_path = user
+        elif user is not None:
+            active, shadowed = "user", ""
+            active_path = user
+        else:
+            active, shadowed = "baked-in", ""
+            assert bundled is not None
+            active_path = bundled
+        tcfg = load_template_config(active_path)
+        desc = tcfg.description or ""
+        rows.append((name, active, shadowed, desc))
+
+    _print_table(
+        ("TEMPLATE", "ACTIVE", "SHADOWED", "DESCRIPTION"),
+        rows,
+    )
     return 0
 
 
@@ -810,19 +1355,46 @@ def _list_sessions() -> int:
 
 def cmd_create(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="aetherion create")
-    parser.add_argument("what", choices=("namespace",))
-    parser.add_argument("name", help="namespace name to create")
+    parser.add_argument("what", choices=("namespace", "template"))
+    parser.add_argument("name", help="name to create")
+    parser.add_argument(
+        "template", nargs="?", default=None,
+        help=(
+            "Template to fork from. Either a local template name "
+            f"(default: {DEFAULT_TEMPLATE!r}) or a git URL with optional "
+            "`#REF` (e.g. `https://example.com/foo.git#v1.0`)."
+        ),
+    )
+    # Legacy flag form, kept for back-compat. The positional wins if both
+    # are given. dest differs from the positional so they don't collide.
+    parser.add_argument(
+        "--template", metavar="SPEC", dest="template_flag", default=None,
+        help="Deprecated alias for the positional TEMPLATE.",
+    )
     parser.add_argument(
         "--no-cache", action="store_true",
-        help="Discard layer cache during the build (`--no-cache`).",
+        help="Discard layer cache during the image build (`namespace` only).",
     )
     args = parser.parse_args(argv)
 
+    template = args.template or args.template_flag
     home = Path.home()
-    return _create_namespace(home, args.name, no_cache=args.no_cache)
+    if args.what == "namespace":
+        return _create_namespace(
+            home, args.name,
+            template=template,
+            no_cache=args.no_cache,
+        )
+    return _create_template(home, args.name, base=template)
 
 
-def _create_namespace(home: Path, name: str, *, no_cache: bool = False) -> int:
+def _create_namespace(
+    home: Path,
+    name: str,
+    *,
+    template: str | None = None,
+    no_cache: bool = False,
+) -> int:
     err = _validate_namespace_name(name)
     if err:
         sys.stderr.write(f"aetherion: {err}\n")
@@ -855,11 +1427,35 @@ def _create_namespace(home: Path, name: str, *, no_cache: bool = False) -> int:
         )
         return 1
 
+    template_spec = template or DEFAULT_TEMPLATE
+    try:
+        src = _resolve_template_source(home, template_spec)
+    except (ValueError, RuntimeError) as e:
+        sys.stderr.write(f"aetherion: {e}\n")
+        return 1
+    config.template = src.display_name
+
+    # Read template.yaml for platform validation + defaults to merge into
+    # the new namespace's config. Templates without one are universally
+    # portable and supply no defaults (current behavior).
+    tcfg = load_template_config(src.path)
+    host = _detect_host_platform()
+    platform_err = _check_template_platform(src.display_name, tcfg, host)
+    if platform_err is not None:
+        sys.stderr.write(f"aetherion: {platform_err}\n")
+        return 1
+
+    # Apply template defaults the launcher recognizes. Unknown keys are
+    # ignored (forward compat); anything explicitly passed on the CLI
+    # would have already won at this point.
+    _apply_template_defaults(config, tcfg.defaults)
+
     sys.stderr.write(
-        f"aetherion: creating namespace {name!r}: build dir at {build_dir}, "
-        f"image {config.image}.\n"
+        f"aetherion: creating namespace {name!r} from template "
+        f"{src.display_name!r}: build dir at {build_dir}, image "
+        f"{config.image}.\n"
     )
-    _populate_build_dir(build_dir, fresh=True)
+    _populate_build_dir(build_dir, src.path, fresh=True)
     rc = _build_image(config.image, build_dir, no_cache=no_cache)
     if rc != 0:
         return rc
@@ -954,13 +1550,42 @@ def cmd_rebuild(argv: list[str]) -> int:
         "--no-cache", action="store_true",
         help="Discard layer cache during the build (`--no-cache`).",
     )
+    template_group = parser.add_mutually_exclusive_group()
+    template_group.add_argument(
+        "--refresh-template", action="store_true",
+        help=(
+            "Re-fork the buildDir from the template currently recorded "
+            "for this namespace. Drops any in-place edits to Dockerfile / "
+            "skeleton."
+        ),
+    )
+    template_group.add_argument(
+        "--template", metavar="SPEC", default=None,
+        help=(
+            "Swap to a different template (local name or git URL[#REF]) "
+            "and re-fork the buildDir from it. Updates the namespace's "
+            "stored template."
+        ),
+    )
     args = parser.parse_args(argv)
 
     home = Path.home()
-    return _rebuild_namespace(home, args.name, no_cache=args.no_cache)
+    return _rebuild_namespace(
+        home, args.name,
+        no_cache=args.no_cache,
+        refresh_template=args.refresh_template,
+        new_template=args.template,
+    )
 
 
-def _rebuild_namespace(home: Path, name: str, *, no_cache: bool) -> int:
+def _rebuild_namespace(
+    home: Path,
+    name: str,
+    *,
+    no_cache: bool,
+    refresh_template: bool = False,
+    new_template: str | None = None,
+) -> int:
     configs = load_config(home)
     if name not in configs:
         sys.stderr.write(
@@ -970,26 +1595,74 @@ def _rebuild_namespace(home: Path, name: str, *, no_cache: bool) -> int:
         return 1
     config = configs[name]
 
-    if not config.build_dir.is_dir():
+    template_to_apply: str | None = None
+    if new_template is not None:
+        template_to_apply = new_template
+    elif refresh_template:
+        if config.template is None:
+            sys.stderr.write(
+                f"aetherion: namespace {name!r} has no recorded template "
+                "to refresh from. Pass `--template SPEC` to set one.\n"
+            )
+            return 1
+        template_to_apply = config.template
+
+    if template_to_apply is not None:
+        try:
+            src = _resolve_template_source(home, template_to_apply)
+        except (ValueError, RuntimeError) as e:
+            sys.stderr.write(f"aetherion: {e}\n")
+            return 1
+        action = "swapping to" if new_template is not None else "refreshing from"
+        sys.stderr.write(
+            f"aetherion: {action} template {src.display_name!r}; "
+            f"re-forking {config.build_dir} (existing Dockerfile / skeleton "
+            "edits will be replaced).\n"
+        )
+        _populate_build_dir(config.build_dir, src.path, fresh=True)
+        config.template = src.display_name
+        configs[name] = config
+        save_config(home, configs)
+    elif not config.build_dir.is_dir():
+        # Build dir missing but no template flag: re-fork from the stored
+        # template (or default if none) so we have something to build.
+        spec = config.template or DEFAULT_TEMPLATE
         sys.stderr.write(
             f"aetherion: build dir for namespace {name!r} is missing at "
-            f"{config.build_dir}; populating from bundled assets.\n"
+            f"{config.build_dir}; re-forking from template {spec!r}.\n"
         )
-        _populate_build_dir(config.build_dir, fresh=True)
+        try:
+            src = _resolve_template_source(home, spec)
+        except (ValueError, RuntimeError) as e:
+            sys.stderr.write(f"aetherion: {e}\n")
+            return 1
+        _populate_build_dir(config.build_dir, src.path, fresh=True)
+        if config.template is None:
+            config.template = src.display_name
+            configs[name] = config
+            save_config(home, configs)
     else:
         # Preserve user edits to Dockerfile/skeleton; only refresh
-        # aetherion-src/ in dev mode.
-        _populate_build_dir(config.build_dir, fresh=False)
+        # aetherion-src/ in dev mode. Use the recorded template (or the
+        # default) as the placeholder source for aetherion-src/ when not
+        # in dev mode.
+        spec = config.template or DEFAULT_TEMPLATE
+        try:
+            src = _resolve_template_source(home, spec)
+        except (ValueError, RuntimeError) as e:
+            sys.stderr.write(f"aetherion: {e}\n")
+            return 1
+        _populate_build_dir(config.build_dir, src.path, fresh=False)
 
     return _build_image(config.image, config.build_dir, no_cache=no_cache)
 
 
 def cmd_delete(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="aetherion delete")
-    parser.add_argument("what", choices=("namespace",))
+    parser.add_argument("what", choices=("namespace", "template"))
     parser.add_argument(
-        "names", nargs="+", metavar="NAMESPACE",
-        help="one or more namespace names to delete",
+        "names", nargs="+", metavar="NAME",
+        help="one or more namespace or template names to delete",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -1000,7 +1673,10 @@ def cmd_delete(argv: list[str]) -> int:
     home = Path.home()
     rc = 0
     for name in args.names:
-        r = _delete_namespace(home, name, force=args.force)
+        if args.what == "namespace":
+            r = _delete_namespace(home, name, force=args.force)
+        else:
+            r = _delete_template(home, name, force=args.force)
         if r != 0:
             rc = r
     return rc
@@ -1105,6 +1781,176 @@ def _delete_namespace(home: Path, name: str, *, force: bool) -> int:
     return 0
 
 
+# Template operations -------------------------------------------------------
+
+def _create_template(home: Path, name: str, *, base: str | None) -> int:
+    err = _validate_template_name(name)
+    if err:
+        sys.stderr.write(f"aetherion: {err}\n")
+        return 2
+
+    user_dir = _user_template_dir(home, name)
+    if user_dir.exists() and _has_real_content(user_dir):
+        sys.stderr.write(
+            f"aetherion: template {name!r} already exists at {user_dir}. "
+            f"Delete it first with `aetherion delete template {name}` or "
+            "edit it in place.\n"
+        )
+        return 1
+
+    base_spec = base or DEFAULT_TEMPLATE
+    try:
+        src = _resolve_template_source(home, base_spec)
+    except (ValueError, RuntimeError) as e:
+        sys.stderr.write(f"aetherion: {e}\n")
+        return 1
+
+    # Warn when the new user template shadows a baked-in one of the same
+    # name. The user can revert by deleting the user copy.
+    if _bundled_template_dir(name).is_dir() and not _looks_like_git_url(name):
+        sys.stderr.write(
+            f"aetherion: warning: user template {name!r} shadows a baked-in "
+            "template of the same name. Run "
+            f"`aetherion delete template {name}` to revert to the baked-in "
+            "version.\n"
+        )
+
+    user_dir.parent.mkdir(parents=True, exist_ok=True)
+    if user_dir.exists():
+        _rmtree_any(user_dir)
+    user_dir.mkdir()
+
+    for entry in TEMPLATE_ENTRIES:
+        s, d = src.path / entry, user_dir / entry
+        if s.is_dir():
+            shutil.copytree(s, d, dirs_exist_ok=True)
+        elif s.is_file():
+            shutil.copy2(s, d)
+        else:
+            # Missing entry in source: write a placeholder for aetherion-src
+            # so downstream Dockerfile COPYs succeed; skip others.
+            if entry == "aetherion-src":
+                d.mkdir(parents=True)
+                (d / ".keep").touch()
+
+    sys.stderr.write(
+        f"aetherion: created template {name!r} at {user_dir} "
+        f"(forked from {src.display_name!r}).\n"
+    )
+    return 0
+
+
+def _delete_template(home: Path, name: str, *, force: bool) -> int:
+    err = _validate_template_name(name)
+    if err:
+        sys.stderr.write(f"aetherion: {err}\n")
+        return 2
+
+    user_dir = _user_template_dir(home, name)
+    bundled = _bundled_template_dir(name)
+    bundled_present = bundled.is_dir()
+
+    if not user_dir.exists():
+        if bundled_present:
+            sys.stderr.write(
+                f"aetherion: template {name!r} is baked-in and read-only; "
+                "nothing to delete on the host side. "
+                f"Run `aetherion create template {name}` to fork it first.\n"
+            )
+        else:
+            sys.stderr.write(
+                f"aetherion: no template {name!r} to delete.\n"
+            )
+        return 1
+
+    # Warn if any namespace still references this template name (string
+    # match — git URLs that resolve via the cache won't match a local name).
+    configs = load_config(home)
+    referring = sorted(
+        n for n, c in configs.items() if c.template == name
+    )
+    if referring:
+        sys.stderr.write(
+            f"aetherion: warning: namespace(s) {', '.join(referring)} record "
+            f"template {name!r}; future `--refresh-template` will resolve "
+            f"to the {'baked-in' if bundled_present else 'next match or fail'}.\n"
+        )
+
+    if not force:
+        if not sys.stdin.isatty():
+            sys.stderr.write(
+                "aetherion: `delete template` requires a tty for "
+                "confirmation, or pass --force.\n"
+            )
+            return 2
+        sys.stderr.write(
+            f"aetherion: this will delete user template {name!r} at "
+            f"{user_dir}.\n"
+        )
+        if bundled_present:
+            sys.stderr.write(
+                f"aetherion: the baked-in {name!r} template will become "
+                "active again after deletion.\n"
+            )
+        sys.stderr.write("aetherion: continue? [y/N] ")
+        sys.stderr.flush()
+        reply = sys.stdin.readline().strip().lower()
+        if reply not in ("y", "yes"):
+            sys.stderr.write("aetherion: aborted.\n")
+            return 1
+
+    _rmtree_any(user_dir)
+    sys.stderr.write(f"aetherion: deleted user template {name!r}.\n")
+    return 0
+
+
+def _edit_template(home: Path, name: str) -> int:
+    err = _validate_template_name(name)
+    if err:
+        sys.stderr.write(f"aetherion: {err}\n")
+        return 2
+
+    user_dir = _user_template_dir(home, name)
+    if not user_dir.is_dir():
+        if not _bundled_template_dir(name).is_dir():
+            sys.stderr.write(
+                f"aetherion: no template {name!r}. Available: "
+                f"{', '.join(sorted(_known_template_names(home))) or '(none)'}.\n"
+            )
+            return 1
+        # Auto-fork the baked-in template so the user has something writable.
+        sys.stderr.write(
+            f"aetherion: template {name!r} is baked-in (read-only); "
+            "forking into your user templates so it's editable.\n"
+        )
+        rc = _create_template(home, name, base=name)
+        if rc != 0:
+            return rc
+
+    dockerfile = user_dir / "Dockerfile"
+    if not dockerfile.is_file():
+        sys.stderr.write(
+            f"aetherion: template {name!r} has no Dockerfile at {dockerfile}; "
+            "create one or restore from a fresh fork.\n"
+        )
+        return 1
+    editor = os.environ.get("EDITOR") or "vi"
+    return subprocess.run([editor, str(dockerfile)]).returncode
+
+
+def cmd_edit(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="aetherion edit",
+        description="Open a template's Dockerfile in $EDITOR (auto-forks "
+                    "baked-in templates).",
+    )
+    parser.add_argument("what", choices=("template",))
+    parser.add_argument("name", help="template name to edit")
+    args = parser.parse_args(argv)
+
+    return _edit_template(Path.home(), args.name)
+
+
 # Launch ---------------------------------------------------------------------
 
 @dataclass
@@ -1112,6 +1958,11 @@ class LaunchOptions:
     create: bool = False
     join: str | None = None
     image_override: str | None = None
+    template: str | None = None
+    display: str | None = None
+    # Raw `--command` value as the user typed it. Resolved to an argv
+    # list at launch via _parse_command_value. None ⇒ flag not given.
+    command_override: str | None = None
     env_overrides: list[str] = field(default_factory=list)
     forward_overrides: list[str] = field(default_factory=list)
     volume_overrides: list[str] = field(default_factory=list)
@@ -1128,8 +1979,11 @@ _LAUNCH_VALUE_FLAGS: dict[str, str] = {
     "--volume": "volume_overrides",
     "--image": "image_override",
     "--join": "join",
+    "--template": "template",
+    "--display": "display",
+    "--command": "command_override",
 }
-_LAUNCH_BOOL_FLAGS: frozenset[str] = frozenset({"--create"})
+_LAUNCH_BOOL_FLAGS: frozenset[str] = frozenset()
 _LAUNCH_OPTIONAL_VALUE_FLAGS: dict[str, str] = {
     "--forward-openclaw": "forward_openclaw",
 }
@@ -1180,8 +2034,25 @@ def _parse_launch_argv(argv: list[str]) -> tuple[str | None, list[str], LaunchOp
             i += 1
             continue
 
-        if tok in _LAUNCH_BOOL_FLAGS:
+        # --create optionally takes the template to fork from:
+        #   NS --create             → default template (bare switch)
+        #   NS --create vscode-ide  → fork from vscode-ide
+        #   NS --create=vscode-ide  → same, `=` form
+        # A following non-flag token is consumed as the template; to pass a
+        # trailing command instead, put it before --create or after `--`.
+        if head == "--create":
             options.create = True
+            if eq:
+                options.template = val
+                i += 1
+            elif i + 1 < n and not argv[i + 1].startswith("-"):
+                options.template = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if tok in _LAUNCH_BOOL_FLAGS:
             i += 1
             continue
 
@@ -1232,6 +2103,476 @@ def _join_session(session: str, command: list[str]) -> int:
     return subprocess.run(cmd).returncode
 
 
+def _resolve_display_mode(mode: str) -> str:
+    """Turn `auto` into the concrete mode it should bind to. Other
+    values pass through unchanged.
+
+    Linux hosts read $WAYLAND_DISPLAY / $DISPLAY directly and fall
+    through to `none` when neither is set — a reasonable default for
+    SSH sessions and other headless contexts.
+
+    macOS has exactly one display backend (XQuartz), so `auto` on
+    darwin collapses to `x11` unconditionally and lets the downstream
+    x11 path probe + halt with an install hint. Silently falling
+    through to `none` like Linux would just defer the failure to
+    "Missing X server or $DISPLAY" inside the container — actively
+    unhelpful when the user clearly wanted display (they passed
+    `auto`, not `none`). Users who actually want headless on macOS can
+    pass `--display none`."""
+    if mode != "auto":
+        return mode
+    if sys.platform == "darwin":
+        return "x11"
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "none"
+
+
+_CONTAINER_RUNTIME_DIR = "/run/user/1000"
+
+
+def _add_dbus_args(
+    volumes: list[str],
+    env_dict: dict[str, str],
+) -> None:
+    """Mount the host's D-Bus session + system buses through to the
+    container, when present. Without the session bus, Electron's
+    `shell.openExternal` (xdg-open) silently no-ops — the most visible
+    symptom is sign-in / OAuth flows where clicking the button just does
+    nothing because no browser ever opens. Forwarding also makes
+    notifications, the secret service / keyring, and other portals work.
+
+    Both buses are best-effort: if the host doesn't have a session bus
+    socket where we expect it, we just skip rather than refusing to
+    launch."""
+    session_sock: Path | None = None
+    addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if addr.startswith("unix:path="):
+        # Standard form: unix:path=/run/user/1000/bus[,…]
+        candidate = Path(addr[len("unix:path="):].partition(",")[0])
+        if candidate.exists():
+            session_sock = candidate
+    if session_sock is None:
+        rd = os.environ.get("XDG_RUNTIME_DIR")
+        if rd:
+            candidate = Path(rd) / "bus"
+            if candidate.exists():
+                session_sock = candidate
+
+    if session_sock is not None:
+        in_sock = f"{_CONTAINER_RUNTIME_DIR}/bus"
+        volumes += ["-v", f"{session_sock}:{in_sock}:rw"]
+        env_dict["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={in_sock}"
+        env_dict.setdefault("XDG_RUNTIME_DIR", _CONTAINER_RUNTIME_DIR)
+
+    # System bus — mount at the same canonical path so libdbus inside
+    # the container finds it without extra env hints, and silences the
+    # "Failed to connect to socket /run/dbus/system_bus_socket" startup
+    # noise that Electron prints during init.
+    sys_sock = Path("/run/dbus/system_bus_socket")
+    if sys_sock.exists():
+        volumes += [
+            "-v",
+            "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket:rw",
+        ]
+
+
+def _xquartz_installed() -> bool:
+    """XQuartz drops both an app bundle and an /opt/X11 prefix on install.
+    Either being present is enough to say it's installed; we don't care
+    which channel (cask, .pkg, source) put it there."""
+    return (
+        Path("/Applications/Utilities/XQuartz.app").is_dir()
+        or Path("/opt/X11").is_dir()
+    )
+
+
+def _xquartz_listening() -> bool:
+    """Probe localhost:6000 — the well-known X11 display-0 TCP port — to
+    see if XQuartz (or something else) is actually accepting connections.
+    A short timeout keeps the launch path responsive when nothing's
+    there."""
+    try:
+        with socket.create_connection(("localhost", 6000), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _x11_probe(host: str = "127.0.0.1", port: int = 6000,
+               timeout: float = 5.0) -> str:
+    """Speak actual X11 to the server and report what it says. This is the only
+    honest readiness signal we have, and it needs no external tools.
+
+    A bare TCP connect is a false positive on macOS: launchd socket-activates
+    XQuartz, so the port accepts connections — and that accept is what *triggers*
+    the cold start — before the server can serve. So we send a real connection
+    setup request and read the reply byte:
+
+      "ok"      server replied Success — it is up *and* this host is authorized
+                with no auth cookie, which is exactly what the container needs.
+      "unauth"  server is up but refused us (Failed / Authenticate); the caller
+                should disable access control (`xhost +`) and probe again.
+      "down"    couldn't connect, or no reply yet — still starting.
+
+    Because launchd hands our connection to XQuartz once it spawns, the recv
+    blocks until the server is genuinely answering; a refused connect returns
+    "down" immediately. Either way the result reflects reality, not a guess."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return "down"
+    try:
+        sock.settimeout(timeout)
+        # Connection setup: little-endian ('l'), protocol 11.0, empty auth
+        # name + data. 12 bytes; the trailing two are pad.
+        sock.sendall(struct.pack("<BxHHHHxx", 0x6C, 11, 0, 0, 0))
+        reply = sock.recv(8)
+    except OSError:
+        return "down"
+    finally:
+        sock.close()
+    if not reply:
+        return "down"
+    # reply[0]: 0 = Failed, 1 = Success, 2 = Authenticate.
+    return "ok" if reply[0] == 1 else "unauth"
+
+
+def _xquartz_ensure_ready() -> bool:
+    """Make XQuartz ready for the container: TCP listener enabled,
+    process running, access control disabled via xhost. Returns True if
+    we end up in that state, False if any step failed (caller then
+    falls back to the manual hint).
+
+    Three things have to be true for the container to talk to XQuartz:
+      1. `org.xquartz.X11 nolisten_tcp` == false — the network listener
+         the Preferences → Security checkbox toggles.
+      2. XQuartz process is running so the listener actually binds.
+      3. `xhost +` (access control off) so XQuartz accepts the
+         container's connection. It arrives via host.docker.internal
+         from the VM's gateway/NAT address — not localhost, and it
+         changes each run — so a per-host grant can't cover it.
+
+    Each step is a one-line command, but failing any of them leaves
+    the user staring at "Missing X server" inside the container. Doing
+    them ourselves removes the entire macOS prerequisite checklist.
+
+    Idempotent: every step is a no-op when already in the target
+    state. Prints a one-line note for each step we actually take so
+    the user can see what changed."""
+    # Step 1 — pref. `defaults read` exits 0 with the value on stdout
+    # when set, nonzero when the key is absent (which means "use the
+    # XQuartz default", which is 1 / don't-listen).
+    pref = subprocess.run(
+        ["defaults", "read", "org.xquartz.X11", "nolisten_tcp"],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    nolisten = pref.stdout.strip() if pref.returncode == 0 else "1"
+
+    restart_needed = False
+    if nolisten != "0":
+        write = subprocess.run(
+            ["defaults", "write", "org.xquartz.X11",
+             "nolisten_tcp", "-bool", "false"],
+            capture_output=True, timeout=5, check=False,
+        )
+        if write.returncode != 0:
+            return False
+        sys.stderr.write(
+            "aetherion: enabled XQuartz TCP listener "
+            "(org.xquartz.X11 nolisten_tcp=false).\n"
+        )
+        restart_needed = True
+
+    # Step 2 — process. Pref changes only take effect on the next
+    # launch, so if we flipped it we have to restart; otherwise we only
+    # touch XQuartz if it isn't already listening.
+    if restart_needed or not _xquartz_listening():
+        if restart_needed:
+            sys.stderr.write("aetherion: restarting XQuartz…\n")
+            # Send Quit via AppleScript first (graceful — XQuartz can
+            # tear down clients cleanly). pkill is the brute fallback
+            # if osascript times out or the app ignores the event.
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "XQuartz" to quit'],
+                capture_output=True, timeout=10, check=False,
+            )
+            for _ in range(20):
+                time.sleep(0.25)
+                if not _xquartz_listening():
+                    break
+            else:
+                subprocess.run(
+                    ["pkill", "-x", "Xquartz"],
+                    capture_output=True, check=False,
+                )
+                time.sleep(0.5)
+        else:
+            sys.stderr.write("aetherion: launching XQuartz…\n")
+        subprocess.run(
+            ["open", "-a", "XQuartz"],
+            capture_output=True, timeout=10, check=False,
+        )
+        # Unconditional settle after a cold launch. The handshake probe below
+        # should make this unnecessary, but XQuartz's launchd socket activation
+        # has proven flaky enough on cold start that a fixed pause first is the
+        # pragmatic floor.
+        sys.stderr.write("aetherion: waiting 5s for XQuartz to start…\n")
+        time.sleep(5)
+
+    # Step 3 — readiness + authorization, in one loop below. xhost lives at
+    # /opt/X11/bin/xhost, which isn't always on PATH.
+    xhost = shutil.which("xhost") or "/opt/X11/bin/xhost"
+
+    # Block until the server can actually serve the container, validated over
+    # the real TCP path (127.0.0.1:6000 — the same XQuartz listener the
+    # container reaches via host.docker.internal). The probe getting any reply
+    # means the server is *serving*, so the "Missing X server" race is won; we
+    # then disable access control so the container's connection is authorized,
+    # and hand off only once the probe confirms "ok". If the server never comes
+    # up we return False so the caller halts with a hint rather than launching
+    # a container that will just crash.
+    deadline = time.monotonic() + 30.0
+    granted = False
+    announced = False
+    while time.monotonic() < deadline:
+        status = _x11_probe("127.0.0.1")
+        if status == "ok":
+            # Server is up and our connection is authorized. Once access control
+            # is off (below), this is what the container's path looks like too.
+            return True
+        if status == "unauth":
+            # Server is serving but refusing unauthorized connections. The
+            # container connects through host.docker.internal, so XQuartz sees
+            # it arriving from the VM's gateway/NAT address — NOT localhost — and
+            # that address changes every run. `xhost +localhost` (or any per-host
+            # grant) therefore can't cover it; the only reliable fix is to
+            # disable access control entirely with bare `xhost +`. Safe under the
+            # "trusted single-user dev machine" assumption that the rest of
+            # aetherion's threat model already makes. DISPLAY=:0 routes this call
+            # through XQuartz's unix socket, usable by the owning user without
+            # prior auth.
+            if not granted and Path(xhost).exists():
+                subprocess.run(
+                    [xhost, "+"],
+                    capture_output=True, timeout=5, check=False,
+                    env={**os.environ, "DISPLAY": ":0"},
+                )
+                granted = True
+                continue  # re-probe; with access control off this reads "ok"
+            # xhost isn't available (or we already ran it and the server still
+            # reports unauth). It's serving, so hand off rather than stall —
+            # better a clear in-container X error than a false 30s timeout.
+            return True
+        # status == "down": still coming up.
+        if not announced:
+            sys.stderr.write("aetherion: waiting for XQuartz to be ready…\n")
+            announced = True
+        time.sleep(0.25)
+
+    sys.stderr.write("aetherion: XQuartz did not become ready within 30s.\n")
+    return False
+
+
+def _display_runtime_args_darwin(
+    mode: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """macOS host (Docker Desktop / podman-machine). The container runs
+    inside a Linux VM, so the Linux host's display plumbing — the
+    /tmp/.X11-unix socket dir, $XAUTHORITY, the D-Bus buses, /dev/dri —
+    would all resolve against the VM, not macOS, if we tried to mount
+    them. Instead we point X11 at XQuartz running on the macOS host over
+    TCP via the well-known host.docker.internal alias.
+
+    Prereqs the user has to set up themselves, in this order: install
+    XQuartz, launch it with "Allow connections from network clients"
+    enabled (Preferences → Security; quit + relaunch for the listener
+    to actually bind), and `xhost +` so XQuartz accepts the
+    connection from the VM. We probe for each here; missing prereqs
+    halt the launch with SystemExit(2) because `display: x11` is a
+    committed declaration that the namespace needs X11, and silently
+    dropping to no-display would just produce an opaque crash inside
+    the container (Cursor's "Missing X server or $DISPLAY" segfault).
+    Users who genuinely want headless can pass `--display none` to
+    override.
+
+    Note: the `auto` mode flows through _resolve_display_mode, which on
+    darwin only returns x11 when the prereqs are already satisfied —
+    so the halts below only fire when the user (or a template default)
+    explicitly committed to x11."""
+    if mode == "wayland":
+        sys.stderr.write(
+            "aetherion: display: wayland not supported on macOS hosts "
+            "(no Wayland compositor); skipping forwarding.\n"
+        )
+        return [], [], []
+    if mode != "x11":
+        return [], [], []
+
+    if not _xquartz_installed():
+        # No X server at all. This is the one prereq the launcher can't
+        # satisfy itself — Homebrew, App Store, and the .pkg installer
+        # all need user interaction. Lead with the brew one-liner;
+        # fall back to a brew.sh pointer when Homebrew isn't around.
+        sys.stderr.write(
+            "aetherion: display: x11 requires XQuartz on macOS, which "
+            "isn't installed.\n"
+        )
+        if shutil.which("brew") is not None:
+            sys.stderr.write(
+                "aetherion:   install:  brew install --cask xquartz\n"
+            )
+        else:
+            sys.stderr.write(
+                "aetherion:   install Homebrew first (https://brew.sh), "
+                "then:\n"
+                "aetherion:     brew install --cask xquartz\n"
+            )
+        sys.stderr.write(
+            "aetherion: refusing to launch without the X server "
+            "(pass --display none to override).\n"
+        )
+        raise SystemExit(2)
+
+    # Auto-configure XQuartz: enable the TCP listener, restart if
+    # needed, disable access control with `xhost +`. Idempotent —
+    # silent when already in the right state.
+    if not _xquartz_ensure_ready():
+        # Auto-config bailed somewhere (osascript timeout, defaults
+        # write failed, listener never came up). Fall back to the
+        # manual hint and halt.
+        sys.stderr.write(
+            "aetherion: display: x11 — couldn't auto-configure XQuartz. "
+            "Try manually:\n"
+            "aetherion:   - XQuartz menu → Preferences → Security → "
+            "\"Allow connections from\n"
+            "aetherion:     network clients\", then quit + relaunch "
+            "XQuartz.\n"
+            "aetherion:   - In a macOS terminal: `xhost +` (the container "
+            "connects from the VM's address, not localhost).\n"
+            "aetherion:   - Verify: `lsof -iTCP:6000 -sTCP:LISTEN` "
+            "should show XQuartz.\n"
+            "aetherion: refusing to launch without the X server "
+            "(pass --display none to override).\n"
+        )
+        raise SystemExit(2)
+
+    # Relocate Cursor/Electron's single-instance IPC socket off the
+    # bind-mounted namespace $HOME. On macOS that home is shared into the
+    # Linux VM over virtiofs/gRPC-FUSE, which doesn't support listen() on a
+    # unix socket — so Cursor's `<userDataPath>/<version>-main.sock` under
+    # ~/.config/Cursor dies at startup with "listen ENOTSUP: operation not
+    # supported on socket". VS Code/Cursor prefer $XDG_RUNTIME_DIR for that
+    # socket when it's set, so point it at a writable in-container tmpfs
+    # (same mechanism the Linux path uses for `vscode-*.sock`). mode=1777
+    # lets UID 1000 write there; podman's --tmpfs takes no uid=/gid=.
+    env = [
+        "-e", "DISPLAY=host.docker.internal:0",
+        "-e", f"XDG_RUNTIME_DIR={_CONTAINER_RUNTIME_DIR}",
+    ]
+    extra = ["--tmpfs", f"{_CONTAINER_RUNTIME_DIR}:rw,mode=1777"]
+    return [], env, extra
+
+
+def _display_runtime_args(mode: str) -> tuple[list[str], list[str], list[str]]:
+    """For a resolved display mode (x11/wayland/none — never `auto`),
+    return the `-v`, `-e`, and extra runtime args to inject. Empty lists
+    for `none`. The caller passes them through to `<runtime> run`.
+
+    Both GUI modes also forward the host's D-Bus session + system buses;
+    Electron / xdg-open / notifications / secret-service all depend on
+    the session bus being reachable, and without it features like the
+    Cursor sign-in flow silently no-op."""
+    if mode == "none":
+        return [], [], []
+    if sys.platform == "darwin":
+        return _display_runtime_args_darwin(mode)
+
+    volumes: list[str] = []
+    env_dict: dict[str, str] = {}
+    extra: list[str] = []
+
+    if mode == "x11":
+        display = os.environ.get("DISPLAY")
+        if not display:
+            sys.stderr.write(
+                "aetherion: display: x11 requested but $DISPLAY isn't set "
+                "on the host; skipping forwarding.\n"
+            )
+            return [], [], []
+        # Mount the host's X socket dir read-write — Cursor/Electron writes
+        # MIT-SHM segments via the socket and read-only would error.
+        x11_sock = Path("/tmp/.X11-unix")
+        if x11_sock.is_dir():
+            volumes += ["-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw"]
+        env_dict["DISPLAY"] = display
+        xauth = os.environ.get("XAUTHORITY")
+        if xauth and Path(xauth).is_file():
+            # Mount the auth cookie at a stable in-container path so
+            # XAUTHORITY can point at it without depending on the host's
+            # path layout (which differs across distros).
+            in_xauth = f"{CONTAINER_HOME}/.Xauthority"
+            volumes += ["-v", f"{xauth}:{in_xauth}:ro"]
+            env_dict["XAUTHORITY"] = in_xauth
+
+    elif mode == "wayland":
+        wd = os.environ.get("WAYLAND_DISPLAY")
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if not wd or not runtime_dir:
+            sys.stderr.write(
+                "aetherion: display: wayland requested but "
+                "$WAYLAND_DISPLAY / $XDG_RUNTIME_DIR isn't set on the "
+                "host; skipping forwarding.\n"
+            )
+            return [], [], []
+        host_sock = Path(runtime_dir) / wd
+        if not host_sock.exists():
+            sys.stderr.write(
+                f"aetherion: display: wayland — host socket {host_sock} "
+                "not found; skipping forwarding.\n"
+            )
+            return [], [], []
+        # Inside the container we mount the runtime dir at /run/user/1000
+        # (the UID-1000 conventional spot) and set XDG_RUNTIME_DIR
+        # accordingly so Electron + GTK pick it up.
+        volumes += ["-v", f"{host_sock}:{_CONTAINER_RUNTIME_DIR}/{wd}:rw"]
+        env_dict["WAYLAND_DISPLAY"] = wd
+        env_dict["XDG_RUNTIME_DIR"] = _CONTAINER_RUNTIME_DIR
+
+    # Writable tmpfs at $XDG_RUNTIME_DIR. Without this, rootless podman
+    # creates `/run/user/1000` as a stub parent for our bind mounts
+    # (session bus, wayland socket) owned by container-root mode 0755,
+    # and apps that try to drop their own sockets next to the bus
+    # (Cursor's `vscode-*.sock`, gpg-agent, dbus-launch, etc.) fail with
+    # EACCES. mode=1777 (sticky-bit, world-writable, same as /tmp) lets
+    # UID 1000 write there without per-runtime branching — podman's
+    # `--tmpfs` doesn't accept uid=/gid= options. The tmpfs has to come
+    # before the bind mounts in the run argv so they layer onto it;
+    # --tmpfs is added to `extra` which is emitted before display_vols.
+    extra += [
+        "--tmpfs",
+        f"{_CONTAINER_RUNTIME_DIR}:rw,mode=1777",
+    ]
+
+    _add_dbus_args(volumes, env_dict)
+
+    # GPU + IPC are useful for both X11 and Wayland Electron paths. /dev/dri
+    # gates access to the host's render nodes (software fallback kicks in
+    # if absent or unusable). `--ipc host` shares the SHM namespace so MIT-
+    # SHM / Chrome shared-memory paths work without copy-through.
+    if Path("/dev/dri").exists():
+        extra += ["--device", "/dev/dri"]
+    extra += ["--ipc", "host"]
+
+    env: list[str] = []
+    for k, v in env_dict.items():
+        env += ["-e", f"{k}={v}"]
+    return volumes, env, extra
+
+
 def cmd_launch(
     namespace: str | None,
     command: list[str],
@@ -1262,7 +2603,11 @@ def cmd_launch(
 
     if namespace not in configs:
         if options.create:
-            rc = _create_namespace(home, namespace, no_cache=False)
+            rc = _create_namespace(
+                home, namespace,
+                template=options.template,
+                no_cache=False,
+            )
             if rc != 0:
                 return rc
             configs = load_config(home)
@@ -1279,6 +2624,12 @@ def cmd_launch(
         sys.stderr.write(
             f"aetherion: namespace {namespace!r} already exists; --create "
             "had nothing to do.\n"
+        )
+    elif options.template is not None:
+        sys.stderr.write(
+            f"aetherion: --template only applies when creating a namespace; "
+            f"ignoring (use `aetherion rebuild namespace {namespace} "
+            f"--template {options.template}` to switch).\n"
         )
 
     config = configs[namespace]
@@ -1335,6 +2686,11 @@ def cmd_launch(
                 f"aetherion: either cd elsewhere, or clear {ns_path} first.\n"
             )
             return 2
+        # Pre-create the mountpoint as the host user so rootless podman
+        # doesn't make a subuid-owned stub during container setup. Empty
+        # dirs get shadowed by the bind mount during the run, then survive
+        # cleanup because our UID can still `rmdir` them later.
+        ns_path.mkdir(parents=True, exist_ok=True)
         workdir_mount = ["-v", f"{pwd}:{container_workdir}:z"]
     else:
         container_workdir = str(pwd)
@@ -1416,6 +2772,11 @@ def cmd_launch(
                         f"{ns_path} already has content in the namespace.\n"
                     )
                     return 2
+                # Pre-create as host user — same reasoning as the workdir
+                # mount above: rootless podman would otherwise stub it as
+                # subuid-owned and break cleanup later.
+                if relative:
+                    ns_path.mkdir(parents=True, exist_ok=True)
             if dst in seen_dst:
                 sys.stderr.write(
                     f"aetherion: duplicate volume mount target {dst!r}; "
@@ -1427,6 +2788,23 @@ def cmd_launch(
         sys.stderr.write(f"aetherion: {e}\n")
         return 2
 
+    # Display forwarding. Resolution order: CLI --display > namespace
+    # YAML > built-in "none". Invalid CLI values error out; invalid YAML
+    # already errored at config load.
+    display_mode: str = "none"
+    if options.display is not None:
+        if options.display not in DISPLAY_MODES:
+            sys.stderr.write(
+                f"aetherion: --display {options.display!r} invalid; "
+                f"choose one of {', '.join(sorted(DISPLAY_MODES))}.\n"
+            )
+            return 2
+        display_mode = options.display
+    elif config.display is not None:
+        display_mode = config.display
+    display_mode = _resolve_display_mode(display_mode)
+    display_vols, display_envs, display_extra = _display_runtime_args(display_mode)
+
     instance_id = secrets.token_hex(4)
     instance_name = f"aetherion-{instance_id}"
 
@@ -1435,6 +2813,26 @@ def cmd_launch(
         "--label", f"{LABEL_IMAGE}={image}",
         "--label", f"{LABEL_WORKDIR}={container_workdir}",
     ]
+
+    # Command resolution order:
+    #   1. Positional trailing command after NAMESPACE (`aetherion
+    #      cursor-ide bash` → bash). Existing behavior; explicit always
+    #      wins.
+    #   2. CLI `--command FOO` (shlex-split into argv).
+    #   3. Namespace config `command:` (set by hand, or written from
+    #      the source template's `defaults.command` at create time).
+    #   4. Empty argv ⇒ defer to the image's CMD (bash for every
+    #      baked-in template).
+    final_command: list[str] = list(command)
+    if not final_command and options.command_override is not None:
+        parsed = _parse_command_value(
+            options.command_override,
+            context="--command",
+        )
+        if parsed:
+            final_command = parsed
+    if not final_command and config.command is not None:
+        final_command = list(config.command)
 
     # The namespace mount lands first; configured volumes layer on, and
     # the workdir mount (always a subpath of CONTAINER_HOME for host
@@ -1448,14 +2846,17 @@ def cmd_launch(
         *host_internal_args(),
         *label_args,
         *env_args,
+        *display_envs,
         *publish_args,
+        *display_extra,
         "-v", f"{ns_home}:{CONTAINER_HOME}:z",
         *volume_args,
+        *display_vols,
         *workdir_mount,
         "-w", container_workdir,
         "-it",
         image,
-        *command,
+        *final_command,
     ]
 
     return subprocess.run(run_argv).returncode
@@ -1468,27 +2869,39 @@ def _print_help() -> None:
         "aetherion — containerized dev environment for AI coding agents.\n"
         "\n"
         "Launch:\n"
-        "  aetherion                                  # launch the default namespace\n"
-        "  aetherion NAMESPACE                        # launch into NAMESPACE\n"
-        "  aetherion NAMESPACE COMMAND [ARG...]       # run COMMAND instead of an interactive shell\n"
-        "  aetherion NAMESPACE --create               # create NAMESPACE if missing, then launch\n"
-        "  aetherion NAMESPACE --join SESSION [CMD]   # exec into a running session\n"
+        "  aetherion                                       # launch the default namespace\n"
+        "  aetherion NAMESPACE                             # launch into NAMESPACE (runs namespace's `command` or bash)\n"
+        "  aetherion NAMESPACE COMMAND [ARG...]            # run COMMAND instead (positional override)\n"
+        "  aetherion NAMESPACE --create [TEMPLATE]         # create NAMESPACE if missing, then launch\n"
+        "  aetherion NAMESPACE --join SESSION [CMD]        # exec into a running session\n"
         "\n"
         "Launch flag overrides (additive on top of the YAML config):\n"
         "  --image REF                                # use a different image for this launch\n"
+        "  --display x11|wayland|auto|none            # override display forwarding for this launch\n"
+        "  --command \"CMD [ARG...]\"                   # override the namespace's default command (shlex-split)\n"
         "  -e, --env NAME=VALUE                       # add an env var (repeatable)\n"
         "  --forward [ADDR:[HOST_PORT:]]CONTAINER_PORT  # publish a port (repeatable)\n"
         "  -v, --volume SRC[:DST]                     # mount a host path (repeatable)\n"
         "  --forward-openclaw [ADDR][:PORT]           # publish OpenClaw + set up loopback bridge\n"
         "\n"
-        "Management verbs:\n"
-        "  aetherion config                           # open ~/.aetherion/config.yaml in $EDITOR\n"
-        "  aetherion list namespaces                  # registered namespaces + image + seed digest\n"
-        "  aetherion list sessions                    # running aetherion containers\n"
-        "  aetherion create namespace NAME [--no-cache]   # populate buildDir, build image, seed $HOME\n"
-        "  aetherion rebuild namespace NAME [--no-cache]  # rebuild the namespace's image\n"
-        "  aetherion reset namespace NAME [--force]       # wipe $HOME and re-seed from the image\n"
-        "  aetherion delete namespace NAME [NAME...] [--force]  # remove $HOME, build dir, image, config entry\n"
+        "Namespace verbs:\n"
+        "  aetherion config                                              # open ~/.aetherion/config.yaml in $EDITOR\n"
+        "  aetherion list namespaces                                     # registered namespaces + image + template + seed\n"
+        "  aetherion list sessions                                       # running aetherion containers\n"
+        "  aetherion create namespace NAME [TEMPLATE] [--no-cache]\n"
+        "  aetherion rebuild namespace NAME [--no-cache] [--refresh-template | --template SPEC]\n"
+        "  aetherion reset namespace NAME [--force]                      # wipe $HOME, re-seed from the image\n"
+        "  aetherion delete namespace NAME [NAME...] [--force]           # remove $HOME, build dir, image, config entry\n"
+        "\n"
+        "Template verbs:\n"
+        "  aetherion list templates                                      # baked-in + user templates\n"
+        "  aetherion create template NAME [--template SPEC]              # fork from SPEC (default: 'default')\n"
+        "  aetherion edit template NAME                                  # open Dockerfile in $EDITOR (auto-forks baked-in)\n"
+        "  aetherion delete template NAME [--force]                      # remove the user copy (baked-in stays)\n"
+        "\n"
+        "Template SPEC:\n"
+        "  - a local template name (`default`, `cursor-ide`, or your own)\n"
+        "  - a git URL with optional ref: `https://github.com/foo/bar.git#v1.0`\n"
         "\n"
         f"State lives under ~/.aetherion/. Reserved namespace names: "
         f"{', '.join(sorted(RESERVED_NAMESPACE_NAMES))}.\n"
@@ -1504,6 +2917,8 @@ def dispatch_verb(verb: str, argv: list[str]) -> int:
         return cmd_list(argv)
     if verb == "create":
         return cmd_create(argv)
+    if verb == "edit":
+        return cmd_edit(argv)
     if verb == "reset":
         return cmd_reset(argv)
     if verb == "rebuild":
@@ -1517,18 +2932,26 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    if argv and argv[0] in ("-h", "--help"):
-        _print_help()
-        return 0
+    # Top-level KeyboardInterrupt guard so Ctrl-C at any confirmation
+    # prompt — or during any subprocess we're waiting on — exits cleanly
+    # with the conventional 128+SIGINT (130) code instead of dumping a
+    # Python traceback. User-initiated abort is not a bug.
+    try:
+        if argv and argv[0] in ("-h", "--help"):
+            _print_help()
+            return 0
 
-    if argv and argv[0] in RESERVED_NAMESPACE_NAMES:
-        return dispatch_verb(argv[0], argv[1:])
+        if argv and argv[0] in RESERVED_NAMESPACE_NAMES:
+            return dispatch_verb(argv[0], argv[1:])
 
-    parsed = _parse_launch_argv(argv)
-    if isinstance(parsed, int):
-        return parsed
-    namespace, command, options = parsed
-    return cmd_launch(namespace, command, options)
+        parsed = _parse_launch_argv(argv)
+        if isinstance(parsed, int):
+            return parsed
+        namespace, command, options = parsed
+        return cmd_launch(namespace, command, options)
+    except KeyboardInterrupt:
+        sys.stderr.write("\naetherion: interrupted.\n")
+        return 130
 
 
 if __name__ == "__main__":
