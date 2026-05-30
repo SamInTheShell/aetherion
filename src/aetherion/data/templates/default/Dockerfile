@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1.7
 #
-# Aetherion: hardened multi-arch dev container.
-# Base: Debian 13 (Trixie) slim — glibc, Tier-1 amd64+arm64, modern toolchains,
-# strong reproducibility/hardening posture (PAC/BTI on arm64, reproducible builds).
+# default — aetherion's language-toolchain baseline.
+# Base: Debian 13 (Trixie) slim — glibc, Tier-1 amd64+arm64, modern toolchains.
+#
+# Scope: enough to build software in the major mainstream languages, with
+# the prompt + identity every aetherion template shares. NO editor (use
+# `nvim` template), NO LSPs/DAPs (they belong with the editor), NO agent
+# CLIs (use `cli-agents` template), NO bundled aetherion/conduit (this
+# image's `aetherion` ARG is declared but unused). Everything that's
+# specifically dev-loop tooling stays — uv, bun, rustup, podman-in-
+# container — because those are how you actually build code, not what
+# you read it with.
 #
 # Build:
 #   podman build --platform=linux/amd64,linux/arm64 -t aetherion:$(date +%Y-%m-%d)-001 .
@@ -21,17 +29,6 @@ ARG TARGETOS
 ARG USERNAME=aetherion
 ARG USER_UID=1000
 ARG USER_GID=1000
-# Channels for Claude Code apt repo: "stable" or "latest"
-ARG CLAUDE_CODE_CHANNEL=latest
-# Neovim release to install from the upstream tarball. Pinned to a 0.11.x
-# patch release because nvim-treesitter's `master` branch (which our plugin
-# spec uses) explicitly does NOT support Neovim 0.12 — the "stable" channel
-# silently jumped to 0.12 and triggered "attempt to call method 'range'
-# (a nil value)" crashes in the treesitter highlighter on markdown.
-# Bump deliberately when upstream nvim-treesitter master regains 0.12
-# support (or when we migrate the plugin spec to its `main` branch).
-# Debian's apt nvim is too old for nvim-lspconfig (requires 0.11+).
-ARG NVIM_VERSION=v0.11.7
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -40,19 +37,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     TZ=Etc/UTC \
-    # Disable apt recommends/suggests globally — smaller, more predictable images
     APT_LISTCHANGES_FRONTEND=none \
     # uv: standardize copy semantics. UV_PYTHON_INSTALL_DIR and
     # UV_TOOL_DIR are set per-invocation during the build (system paths)
-    # and again at the end as user paths for runtime — see stage 11+.
+    # and again at the end as user paths for runtime.
     UV_LINK_MODE=copy \
-    # Don't let Python buffer logs
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    # Default editor for git, sudo, etc. — points at the upstream nvim from
-    # stage 3c (system apt nvim is intentionally not installed).
-    EDITOR=nvim \
-    VISUAL=nvim
+    PYTHONUNBUFFERED=1
 
 # Tell apt: don't pull recommends, don't pull suggests, don't cache pkgs.
 # Must land before the first apt-get update below.
@@ -60,8 +51,6 @@ COPY skeleton/etc/apt/apt.conf.d/99-aetherion-minimal /etc/apt/apt.conf.d/99-aet
 
 # ---------------------------------------------------------------------------
 # Stage 1: bootstrap minimal trust anchors
-# We need: ca-certificates, curl, gpg before we add any third-party repos.
-# Everything else comes after, behind signature verification.
 # ---------------------------------------------------------------------------
 RUN apt-get update \
  && apt-get install -y \
@@ -71,33 +60,18 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# Stage 2: add signed third-party repositories
-#   - Anthropic Claude Code (official signed apt repo)
-#   Mise we install via signed install script (GPG-verified).
-# ---------------------------------------------------------------------------
-
-# Claude Code signed apt repo — Anthropic's official distribution path.
-# Key fingerprint pinned and verified before trusting.
-# Ref: https://code.claude.com/docs/en/setup
-RUN install -m 0755 -d /etc/apt/keyrings \
- && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
-        | gpg --dearmor -o /etc/apt/keyrings/claude-code.gpg \
- && chmod a+r /etc/apt/keyrings/claude-code.gpg \
- && printf '%s\n' \
-        'Types: deb' \
-        "URIs: https://downloads.claude.ai/claude-code/apt/${CLAUDE_CODE_CHANNEL}" \
-        "Suites: ${CLAUDE_CODE_CHANNEL}" \
-        'Components: main' \
-        "Architectures: $(dpkg --print-architecture)" \
-        'Signed-By: /etc/apt/keyrings/claude-code.gpg' \
-    > /etc/apt/sources.list.d/claude-code.sources
-
-# ---------------------------------------------------------------------------
-# Stage 3: install the kitchen sink from apt (system-level, glibc-linked)
-# Grouped logically. Cleanup happens in the SAME RUN to keep layer slim.
+# Stage 2: install the kitchen sink from apt (system-level, glibc-linked)
+# Cleanup happens in the SAME RUN to keep the layer slim.
 # ---------------------------------------------------------------------------
 RUN apt-get update \
  && apt-get install -y \
+        # --- baseline shell + observability (shared with every template) ---
+        bash \
+        bash-completion \
+        less \
+        locales \
+        lsof \
+        net-tools \
         # --- core build / dev essentials ---
         build-essential \
         clang \
@@ -115,8 +89,6 @@ RUN apt-get update \
         tar \
         rsync \
         # --- shells & TUI niceties ---
-        bash-completion \
-        less \
         man-db \
         tmux \
         # --- network / debug utilities ---
@@ -126,12 +98,11 @@ RUN apt-get update \
         netcat-openbsd \
         # socat: powers /etc/profile.d/aetherion-bridge.sh, which proxies
         # in-container loopback services to the container's external
-        # interface so `--forward-…` flags can publish them.
+        # interface so `--forward-…` flags can publish them. The script
+        # silently no-ops without AETHERION_BRIDGE_PORTS, so socat being
+        # installed here costs nothing for users who never set it.
         socat \
-        # --- editor + base CLI tooling ---
-        # Note: nvim is NOT installed from apt — Debian 13 ships 0.10.x which
-        # is too old for current nvim-lspconfig. See stage 3c below for the
-        # upstream tarball install.
+        # --- base CLI tooling ---
         ripgrep \
         fd-find \
         fzf \
@@ -141,8 +112,6 @@ RUN apt-get update \
         openssh-client \
         # --- supply-chain visibility ---
         debian-repro-status \
-        # --- agentic coding ---
-        claude-code \
         # --- python (system minimal; uv handles the real thing) ---
         python3 \
         python3-venv \
@@ -172,9 +141,7 @@ RUN apt-get update \
         slirp4netns \
         uidmap \
         crun \
-        # --- locale support (so UTF-8 is real) ---
-        locales \
-# generate a UTF-8 locale (C.UTF-8 is always present, this is belt+suspenders)
+# generate a UTF-8 locale (C.UTF-8 is always present; en_US is belt+suspenders)
  && sed -i -e 's/# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
  && locale-gen \
 # aggressive cleanup in the SAME layer
@@ -209,13 +176,6 @@ RUN apt-get update \
 # ---------------------------------------------------------------------------
 # OPTIONAL [A]: CUDA userspace libraries for NVIDIA GPU acceleration
 # ---------------------------------------------------------------------------
-# Adds NVIDIA's signed CUDA apt repo and installs the CUDA toolkit userspace
-# (nvcc, cuBLAS, cuFFT, etc.). Does NOT install kernel drivers — those must
-# be present on the HOST. Adds ~3-5GB to image size.
-#
-# At runtime, run the container with NVIDIA's container toolkit on the host:
-#   podman run --device nvidia.com/gpu=all aetherion:latest
-#
 # RUN install -m 0755 -d /etc/apt/keyrings \
 #  && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/debian13/$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/sbsa/')/cuda-archive-keyring.gpg \
 #         -o /etc/apt/keyrings/cuda-archive-keyring.gpg \
@@ -236,18 +196,6 @@ RUN apt-get update \
 # ---------------------------------------------------------------------------
 # OPTIONAL [B]: ROCm userspace libraries for AMD GPU acceleration
 # ---------------------------------------------------------------------------
-# Adds AMD's signed ROCm apt repo and installs the HIP/ROCm userspace
-# (hipcc, hipBLAS, rocBLAS, etc.). Does NOT install kernel drivers — the
-# amdgpu module must be present on the HOST. Adds ~4-6GB to image size.
-#
-# At runtime, the launcher must pass GPU device nodes:
-#   podman run --device /dev/kfd --device /dev/dri \
-#              --group-add video --group-add render \
-#              aetherion:latest
-#
-# ROCm 7.x requires recent kernels (host kernel 6.x+ strongly recommended).
-# Container architecture: amd64 only. ARM64 ROCm is not yet GA.
-#
 # RUN install -m 0755 -d /etc/apt/keyrings \
 #  && curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
 #         | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
@@ -278,12 +226,6 @@ RUN apt-get update \
 # default build needs. This block is only relevant if you want llama.cpp
 # pre-built INTO the image rather than letting users build it themselves.
 #
-# Most users should NOT bake llama.cpp in; let it live in a project dir.
-# The compiled binary depends on the exact GPU backend chosen, so baking
-# it in commits you to one variant per image.
-#
-# If you do want to pre-build the CPU + OpenBLAS variant into /opt/llama.cpp:
-#
 # RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
 #  && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build \
 #         -G Ninja \
@@ -294,143 +236,27 @@ RUN apt-get update \
 #  && find /opt/llama.cpp -name '*.o' -delete \
 #  && find /opt/llama.cpp -name '.git' -type d -exec rm -rf {} +
 # ENV PATH=/opt/llama.cpp/build/bin:${PATH}
-#
-# For NVIDIA, swap the cmake flags for:
-#   -DGGML_CUDA=ON -DGGML_CUDA_F16=ON
-# For AMD/ROCm, swap them for:
-#   -DGGML_HIPBLAS=ON
-# (And uncomment OPTIONAL [A] or [B] above first.)
 
 # ===========================================================================
 # END OPTIONAL FEATURE BLOCKS
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Stage 3c: install latest stable Neovim from the official release tarball
-# Debian 13 only ships nvim 0.10.x; nvim-lspconfig and many modern plugins
-# require 0.11+. The upstream project publishes a glibc-linked tarball per
-# arch — no sidecar checksum file is shipped, so trust here is TLS-to-GitHub
-# plus an optional sha256 pin (see NVIM_SHA256_* args below). Lands in
-# /opt/nvim with `nvim` and `vim` symlinks under /usr/local/bin.
-# Ref: https://github.com/neovim/neovim/releases
-# ---------------------------------------------------------------------------
-# Optional per-arch sha256 pins. Leave blank to skip verification (TLS only).
-# When pinning a NVIM_VERSION, set both to the matching tarball hashes:
-#   --build-arg NVIM_VERSION=v0.11.3 \
-#   --build-arg NVIM_SHA256_AMD64=<sha> --build-arg NVIM_SHA256_ARM64=<sha>
-ARG NVIM_SHA256_AMD64=""
-ARG NVIM_SHA256_ARM64=""
-RUN set -eu; \
-    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-        amd64) NVIM_ARCH=linux-x86_64; NVIM_SHA="${NVIM_SHA256_AMD64}" ;; \
-        arm64) NVIM_ARCH=linux-arm64;  NVIM_SHA="${NVIM_SHA256_ARM64}" ;; \
-        *) echo "unsupported arch: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
-    esac; \
-    NVIM_TARBALL="nvim-${NVIM_ARCH}.tar.gz"; \
-    NVIM_BASE="https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}"; \
-    cd /tmp; \
-    curl -fsSL -O "${NVIM_BASE}/${NVIM_TARBALL}"; \
-    if [ -n "${NVIM_SHA}" ]; then \
-        echo "${NVIM_SHA}  ${NVIM_TARBALL}" | sha256sum -c -; \
-    else \
-        echo "WARN: NVIM_SHA256_${TARGETARCH:-host} unset — trusting TLS only"; \
-    fi; \
-    tar -C /opt -xzf "${NVIM_TARBALL}"; \
-    mv "/opt/nvim-${NVIM_ARCH}" /opt/nvim; \
-    ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim; \
-    ln -sf /opt/nvim/bin/nvim /usr/local/bin/vim; \
-    rm -f "/tmp/${NVIM_TARBALL}"; \
-    nvim --version | head -1
-
-# ---------------------------------------------------------------------------
-# Stage 3b: install starship prompt (official signed installer)
-# Goes to /usr/local/bin so every shell on every user sees it. The installer
-# detects the target arch and pulls the matching prebuilt binary, so this
-# works for amd64 and arm64 alike.
-# Ref: https://starship.rs/install.sh
+# Stage 3: starship prompt (required by STYLE.md)
 # ---------------------------------------------------------------------------
 RUN curl -fsSL https://starship.rs/install.sh \
         | sh -s -- --yes --bin-dir /usr/local/bin \
  && starship --version
 
 # ---------------------------------------------------------------------------
-# Stage 3d: system-wide LSP / DAP binaries (replaces Mason as our package
-# manager). We fetch upstream release artifacts directly because Mason is
-# unreliable in --headless build contexts: it kicks off async installs that
-# don't survive `+qa`, orphans lockfiles, and its UI redraw path runs
-# `:!clear` which trips `set -e` on missing TERM. Going to the source means:
-#   - one network round-trip per tool, fully synchronous
-#   - everything baked into the image (zero install on first nvim launch)
-#   - nvim config points at fixed system paths, easy to introspect
-# Versions default to the latest GitHub release at build time; pin them via
-# --build-arg for reproducibility.
+# Stage 4: install Node.js LTS from the upstream tarball
 # ---------------------------------------------------------------------------
-ARG LUA_LS_VERSION=
-ARG CODELLDB_VERSION=
-ARG JS_DEBUG_VERSION=
-RUN set -eu; \
-    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-        amd64) LUA_LS_ARCH=linux-x64;   RA_ARCH=x86_64-unknown-linux-gnu;  CODELLDB_ARCH=linux-x64   ;; \
-        arm64) LUA_LS_ARCH=linux-arm64; RA_ARCH=aarch64-unknown-linux-gnu; CODELLDB_ARCH=linux-arm64 ;; \
-        *) echo "unsupported arch: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
-    esac; \
-    \
-    # ----- lua-language-server (LuaLS) -----
-    if [ -z "${LUA_LS_VERSION}" ]; then \
-        LUA_LS_VERSION=$(curl -fsSL https://api.github.com/repos/LuaLS/lua-language-server/releases/latest | jq -r .tag_name); \
-    fi; \
-    mkdir -p /opt/lua-language-server; \
-    curl -fsSL "https://github.com/LuaLS/lua-language-server/releases/download/${LUA_LS_VERSION}/lua-language-server-${LUA_LS_VERSION}-${LUA_LS_ARCH}.tar.gz" \
-        | tar -C /opt/lua-language-server -xz; \
-    ln -sf /opt/lua-language-server/bin/lua-language-server /usr/local/bin/lua-language-server; \
-    lua-language-server --version; \
-    \
-    # ----- rust-analyzer (single gzipped binary, /latest/download is stable) -----
-    curl -fsSL "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-${RA_ARCH}.gz" \
-        | gunzip > /usr/local/bin/rust-analyzer; \
-    chmod 0755 /usr/local/bin/rust-analyzer; \
-    rust-analyzer --version; \
-    \
-    # ----- codelldb (vsix is a zip; we want extension/adapter/) -----
-    if [ -z "${CODELLDB_VERSION}" ]; then \
-        CODELLDB_VERSION=$(curl -fsSL https://api.github.com/repos/vadimcn/codelldb/releases/latest | jq -r .tag_name); \
-    fi; \
-    mkdir -p /opt/codelldb; \
-    curl -fsSL "https://github.com/vadimcn/codelldb/releases/download/${CODELLDB_VERSION}/codelldb-${CODELLDB_ARCH}.vsix" -o /tmp/codelldb.vsix; \
-    unzip -q /tmp/codelldb.vsix -d /opt/codelldb; \
-    rm /tmp/codelldb.vsix; \
-    chmod +x /opt/codelldb/extension/adapter/codelldb; \
-    ln -sf /opt/codelldb/extension/adapter/codelldb /usr/local/bin/codelldb; \
-    \
-    # ----- js-debug-adapter (vscode-js-debug; pure JS, no arch split) -----
-    if [ -z "${JS_DEBUG_VERSION}" ]; then \
-        JS_DEBUG_VERSION=$(curl -fsSL https://api.github.com/repos/microsoft/vscode-js-debug/releases/latest | jq -r .tag_name); \
-    fi; \
-    mkdir -p /opt/js-debug-adapter; \
-    curl -fsSL "https://github.com/microsoft/vscode-js-debug/releases/download/${JS_DEBUG_VERSION}/js-debug-dap-${JS_DEBUG_VERSION}.tar.gz" \
-        | tar -C /opt/js-debug-adapter -xz; \
-    \
-    # ----- debugpy (Python DAP; pip into a system-managed venv) -----
-    # PEP 668 marks the system Python as externally-managed on Debian 13;
-    # --break-system-packages flips the safety off, which is what we want
-    # for a baked image where the system Python is ours to manage.
-    pip3 install --break-system-packages --no-cache-dir --quiet debugpy; \
-    python3 -c "import debugpy; print('debugpy', debugpy.__version__)"
-
-# ---------------------------------------------------------------------------
-# Stage 3f: install Node.js LTS from the upstream tarball
-#
-# We bun for the JS runtime where possible, but some vendor CLIs (openclaw
-# in particular — `engines: {"node": ">=22.16.0"}`) rely on node-specific
-# error-code semantics in their launcher scripts that bun doesn't replicate.
-# Real node is the path of least resistance: it ships its own npm/npx, so
-# tools that gate on `LookPath("npm")` or shell out to `npm install -g` are
-# all happy, and `#!/usr/bin/env node` shebangs resolve to a real node.
-#
-# Bun stays installed (stage 6) as a fast user-scoped runtime. It just stops
-# pretending to be node.
+# Some user-facing JS tools rely on node-specific error-code semantics in
+# their launcher scripts that bun doesn't replicate. Real node is the
+# path of least resistance: it ships its own npm/npx, so tools that
+# shell out to npm all just work. Bun stays installed (stage 6) as a
+# fast user-scoped runtime — it just doesn't pretend to be node.
 # Ref: https://nodejs.org/dist/
-# ---------------------------------------------------------------------------
 ARG NODE_VERSION=v22.22.3
 ARG NODE_SHA256_AMD64=""
 ARG NODE_SHA256_ARM64=""
@@ -458,49 +284,41 @@ RUN set -eu; \
     node --version; \
     npm --version
 
-# Put /opt/node/bin on PATH for subsequent build stages so npm-installed
-# global binaries (stage 3g) and any downstream stages that need to invoke
-# them resolve without absolute paths. The user-scoped PATH set in stage 5
-# re-asserts this same entry alongside the user's other tool dirs.
+# Put /opt/node/bin on PATH for subsequent build stages so anything that
+# shells out to npm during the build resolves without absolute paths.
 ENV PATH=/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ---------------------------------------------------------------------------
-# Stage 3g: pre-install LSPs and vendor agent CLIs globally via npm
-#
-# Lands in /opt/node/lib/node_modules with bin shims at /opt/node/bin (on
-# PATH via the symlinks above). Installed as root before the aetherion user
-# exists — these are system-wide tools and the user's $HOME stays clean.
-#
-# Agent CLIs covered:
-#   gemini   (@google/gemini-cli)
-#   copilot  (@github/copilot)
-#   codex    (@openai/codex)
-#   pi       (@earendil-works/pi-coding-agent)
-#   openclaw (openclaw — needs real node, see stage 3f)
-# LSPs covered:
-#   tsc + typescript-language-server, pyright, vim-language-server
-# `npm cache clean --force` reclaims the tarball download cache.
+# Stage 5: Rust toolchain (rustup, system-wide)
 # ---------------------------------------------------------------------------
-RUN npm install -g --omit=dev --no-fund --no-audit \
-        typescript \
-        typescript-language-server \
-        pyright \
-        vim-language-server \
-        @google/gemini-cli \
-        @github/copilot \
-        @openai/codex \
-        @earendil-works/pi-coding-agent \
-        openclaw \
- && command -v typescript-language-server \
- && command -v gemini \
- && command -v copilot \
- && command -v codex \
- && command -v pi \
- && command -v openclaw \
- && npm cache clean --force
+# rustup installs to RUSTUP_HOME (toolchain) + CARGO_HOME (binaries). We
+# point both at /usr/local so rustc/cargo land on the system PATH and
+# every user picks them up without per-$HOME bootstrap. Profile is
+# `minimal` (no rust-docs — a few hundred MB saved) plus rustfmt and
+# clippy components because no Rust dev loop is really complete without
+# them. At runtime we re-point CARGO_HOME at the user's $HOME so
+# `cargo install <crate>` writes user-owned binaries to ~/.cargo/bin
+# without colliding with the root-owned baked toolchain.
+# Ref: https://rustup.rs/
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+ && chmod +x /tmp/rustup-init.sh \
+ && /tmp/rustup-init.sh \
+        -y \
+        --no-modify-path \
+        --default-toolchain stable \
+        --profile minimal \
+        --component rustfmt \
+        --component clippy \
+ && rustc --version \
+ && cargo --version \
+ && rm /tmp/rustup-init.sh \
+ && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
 # ---------------------------------------------------------------------------
-# Stage 4: create the non-root user with rootless-podman-friendly subid maps
+# Stage 6: create the non-root user with rootless-podman-friendly subid maps
 # ---------------------------------------------------------------------------
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
  && useradd  --uid ${USER_UID} --gid ${USER_GID} \
@@ -515,27 +333,24 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
 # pick fuse-overlayfs (works without /dev/fuse passthrough on most hosts).
 COPY skeleton/etc/containers/ /etc/containers/
 
-# Loopback bridge hook — sourced by /etc/profile when an AETHERION_BRIDGE_PORTS
-# env var is set (the aetherion launcher does this for `--forward-<agent>`
-# convenience flags). See the script for the full explanation.
+# Loopback bridge hook — sourced by /etc/profile when AETHERION_BRIDGE_PORTS
+# is set (the aetherion launcher does this for `--forward-<agent>`
+# convenience flags). Silently no-ops otherwise.
 COPY --chmod=0644 skeleton/etc/profile.d/aetherion-bridge.sh /etc/profile.d/aetherion-bridge.sh
 
 # ---------------------------------------------------------------------------
-# Stage 5: skeleton dotfiles (root → /home/${USERNAME})
+# Stage 7: skeleton dotfiles (root → /home/${USERNAME})
 # ---------------------------------------------------------------------------
 # Stays as root throughout the user-tool installs below — everything that
-# used to live under /home/${USERNAME} has been moved to system paths
+# could land under /home/${USERNAME} has been moved to system paths
 # (/usr/local/bin, /opt/*) so the image's $HOME contains only genuine
-# config that ships in skeleton/. This keeps the aetherion namespace seed
+# config that ships in skeleton/. Keeps the aetherion namespace seed
 # (which captures /home/aetherion verbatim at first launch) small and
 # avoids freezing toolchain versions into individual namespaces.
-#
-# Overlays on top of the /etc/skel files dropped by useradd; our .bashrc
-# wins, .profile is left alone so the standard login -> .bashrc chain works.
 COPY --chown=${USERNAME}:${USERNAME} skeleton/home/${USERNAME}/ /home/${USERNAME}/
 
 # ---------------------------------------------------------------------------
-# Stage 6: system-wide developer tooling
+# Stage 8: system-wide developer tooling
 # ---------------------------------------------------------------------------
 # Everything in this stage installs to /usr/local/bin or /opt — never under
 # /home/${USERNAME}. Rationale: the aetherion launcher bind-mounts a
@@ -554,149 +369,16 @@ RUN curl -fsSL https://astral.sh/uv/install.sh \
 
 # bun (Oven) — binary tree under /opt/bun, with a symlink at
 # /usr/local/bin/bun so it's discoverable without /opt/bun/bin on PATH.
-# Bun is the system JS runtime + bundler; real node + npm live system-wide
-# at /opt/node (stage 3f/3g) and are what npm-based agent CLIs (pi,
-# openclaw, codex) find on PATH.
+# Bun is the system JS runtime + bundler; real node + npm live at
+# /opt/node (stage 4) for tools that need genuine node semantics.
 RUN curl -fsSL https://bun.sh/install \
         | env BUN_INSTALL=/opt/bun bash \
  && ln -sf /opt/bun/bin/bun /usr/local/bin/bun \
  && bun --version
 
-# Go-based LSP + DAP (gopls, dlv). Built with a throwaway GOPATH so the
-# module cache (which sets parent dirs to 0555 — historically the source
-# of the launcher's seed-time chmod failures) never lands under any $HOME.
-# GOBIN places the compiled binaries directly in /usr/local/bin.
-RUN GOPATH=/tmp/gobuild GOBIN=/usr/local/bin \
-        go install golang.org/x/tools/gopls@latest \
- && GOPATH=/tmp/gobuild GOBIN=/usr/local/bin \
-        go install github.com/go-delve/delve/cmd/dlv@latest \
- && gopls version \
- && dlv version \
- && rm -rf /tmp/gobuild /root/.cache/go-build
-
-# posting (https://posting.sh) — a TUI HTTP client (Postman-in-the-terminal).
-# Installed as a uv tool to /opt/uv-tools, with the launcher shim landing
-# in /usr/local/bin. UV_PYTHON_INSTALL_DIR steers the downloaded Python
-# 3.13 interpreter into /opt/uv-pythons so it lives system-wide alongside
-# the venv (every uv tool below shares the same interpreter pool).
-RUN UV_TOOL_DIR=/opt/uv-tools \
-    UV_TOOL_BIN_DIR=/usr/local/bin \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
-        uv tool install --python 3.13 posting \
- && posting --help >/dev/null
-
-# Hermes Agent (https://github.com/NousResearch/hermes-agent) — Nous
-# Research's self-improving CLI agent, distributed as the `hermes-agent`
-# PyPI package with a `hermes` entry point. Same uv-tool shape as posting
-# above; reuses the /opt/uv-pythons Python 3.13. Config/state lives in
-# ~/.hermes (HERMES_HOME) inside the user's namespace, persisted by the
-# namespace mount.
-RUN UV_TOOL_DIR=/opt/uv-tools \
-    UV_TOOL_BIN_DIR=/usr/local/bin \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
-        uv tool install --python 3.13 hermes-agent \
- && hermes --help >/dev/null
-
-# Cursor Agent — vendor agent CLI from Cursor. Installer hardcodes
-# ~/.local/bin (relative to $HOME). We point HOME at a system directory
-# (/opt/cursor-agent-home) so the install lands there permanently;
-# symlinks into /usr/local/bin put it on PATH for any user. Self-update
-# would write back into the same system directory; users can't
-# self-update without sudo, which is the right default for a baked
-# system tool. Trust: TLS to cursor.com plus whatever signing the
-# installer enforces internally.
-#
-# Cursor renamed the binary from `cursor-agent` → `agent` somewhere in
-# late 2025/early 2026. We sniff for whichever name the installer
-# dropped under .local/bin and expose it under BOTH names from
-# /usr/local/bin: `agent` (the current canonical) and `cursor-agent`
-# (the historical name, kept so any scripts/muscle memory still work).
-# Errors out only if NEITHER name was installed.
-# Ref: https://docs.cursor.com/en/cli/overview
-RUN install -d /opt/cursor-agent-home \
- && curl -fsSL https://cursor.com/install \
-        | env HOME=/opt/cursor-agent-home bash \
- && ls /opt/cursor-agent-home/.local/bin/ \
- && BIN= \
- && for name in agent cursor-agent; do \
-        if [ -e "/opt/cursor-agent-home/.local/bin/$name" ]; then \
-            BIN="/opt/cursor-agent-home/.local/bin/$name"; \
-            break; \
-        fi; \
-    done \
- && if [ -z "$BIN" ]; then \
-        echo "cursor installer produced neither 'agent' nor 'cursor-agent'" >&2; \
-        exit 1; \
-    fi \
- && ln -sf "$BIN" /usr/local/bin/agent \
- && ln -sf "$BIN" /usr/local/bin/cursor-agent \
- && agent --version
-
 # ---------------------------------------------------------------------------
-# Stage 7: nvim plugins + treesitter parsers — deferred to first launch
+# Stage 9: final cleanup of root-side caches
 # ---------------------------------------------------------------------------
-# Used to bootstrap Lazy.nvim + treesitter headlessly at build, baking
-# ~1GB of plugin state into the image's $HOME. That bloated every
-# namespace seed even for users who never opened nvim, AND the plugins
-# froze at the version the image happened to ship. Now: nothing happens
-# here. On first `nvim` invocation inside a namespace, init.lua's
-# bootstrap clones Lazy.nvim, Lazy auto-installs plugins, and treesitter
-# parsers compile on first file open (the C toolchain from stage 3 is
-# present). Cost: a few minutes of one-time setup per namespace that
-# actually uses nvim. Benefit: zero footprint for users who don't.
-
-## ---------------------------------------------------------------------------
-## Stage 9: generate embedded SBOM at /etc/sbom.spdx.json
-## This makes the image self-describing — anyone can introspect what's inside
-## with `podman run --rm aetherion:latest cat /etc/sbom.spdx.json`.
-##
-## Syft is installed via Anchore's official signed install script, used to
-## scan the entire filesystem, then removed so we don't ship the syft binary.
-## We use SPDX JSON (ISO 5962:2021) for archival/forensic durability.
-##
-## Caveat: an SBOM generated inside a build cannot literally include itself.
-## The output here describes every installed package, which is what matters
-## for CVE tracking. For an external authoritative SBOM, run syft against
-## the published image post-build.
-## ---------------------------------------------------------------------------
-#USER root
-## IMPORTANT: syft is a Go binary, and the global ENV at stage 5 sets
-## HOME=/home/${USERNAME}. If we run it with that HOME, the embedded Go
-## runtime initializes ~/.cache/go-build, ~/.config/go/telemetry, and even
-## pre-seeds ~/go/pkg/mod/{golang.org,github.com} — all owned by root.
-## That breaks every subsequent `go install` the user runs (gopls, dlv, etc.)
-## with "permission denied" inside their own $HOME. Pin HOME to a throwaway
-## dir for the scan, then belt+suspenders chown the user home at the end.
-#RUN curl -sSfL https://get.anchore.io/syft \
-#        | sh -s -- -b /usr/local/bin \
-# && mkdir -p /tmp/syft-home \
-# && HOME=/tmp/syft-home syft version \
-# && HOME=/tmp/syft-home syft dir:/ \
-#        --source-name "aetherion" \
-#        --source-version "rolling" \
-#        --exclude './proc' \
-#        --exclude './sys' \
-#        --exclude './dev' \
-#        --exclude './tmp' \
-#        --exclude './var/cache' \
-#        --exclude './home/'"${USERNAME}"'/.cache' \
-#        -o spdx-json=/etc/sbom.spdx.json \
-# && chmod 0644 /etc/sbom.spdx.json \
-# # Remove syft itself so we don't ship the generator in the image.
-# && rm -f /usr/local/bin/syft \
-# && rm -rf /tmp/syft-home \
-# # Belt-and-suspenders: anything that landed in $HOME during root-stages
-# # (telemetry, caches) gets handed back to the user.
-# && chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}
-#USER ${USERNAME}
-
-# ---------------------------------------------------------------------------
-# Stage 10: final cleanup of root-side caches
-# ---------------------------------------------------------------------------
-# Build-time caches under /root (the build runs as root throughout). uv's
-# wheels/builds cache balloons during the tool installs above; clean
-# unconditionally. /tmp is wiped to drop the throwaway gobuild dir and
-# anything else stages above left behind.
 RUN rm -rf \
         /root/.cache/pip \
         /root/.cache/uv \
@@ -704,61 +386,37 @@ RUN rm -rf \
         /tmp/* /var/tmp/* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Stage 11: aetherion + conduit (parked at the end of the build deliberately)
+# AETHERION_SPEC declared (and intentionally unused) so the launcher can
+# pass --build-arg AETHERION_SPEC=... uniformly across every baked-in
+# template without erroring on "unknown build arg". This template does
+# NOT install aetherion/conduit inside the container — use the
+# `cli-agents` template if you want conduit available in-container.
 # ---------------------------------------------------------------------------
-# Both binaries ship from one PyPI distribution (`aetherion`); installing
-# it lands `conduit` (the in-container utility) and also drops the
-# launcher itself in /usr/local/bin for symmetry. AETHERION_SPEC defaults
-# to the unversioned `aetherion` (latest from PyPI) as a fallback when
-# the build is driven by hand (`podman build .`). The aetherion launcher
-# always overrides it: to /tmp/aetherion-src in dev-mode source-checkout
-# runs, or to a pinned `aetherion==<launcher-version>` otherwise —
-# keeping the in-container CLIs lockstep with whatever launcher kicked
-# off the build.
-#
-# Installed system-wide under /opt/uv-tools with shims in /usr/local/bin
-# (same shape as posting/hermes above), so the namespace seed doesn't
-# freeze the version. Image rebuilds deliver fresh aetherion/conduit to
-# every existing namespace immediately.
-#
-# Position rationale: source overlays change often during development of
-# the launcher itself. Putting this layer first would invalidate every
-# downstream layer (skeleton copy, system tool installs, cleanup) on
-# each edit — typically minutes of wasted rebuild. Parking it as the
-# last RUN before the runtime stanza means a conduit edit only re-runs
-# the COPY + the (sub-second) `uv tool install`, and every heavyweight
-# stage stays cached.
 ARG AETHERION_SPEC=aetherion
-COPY aetherion-src/ /tmp/aetherion-src/
-RUN UV_TOOL_DIR=/opt/uv-tools \
-    UV_TOOL_BIN_DIR=/usr/local/bin \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-pythons \
-        uv tool install --python 3.13 "$AETHERION_SPEC" \
- && conduit --help >/dev/null \
- && aetherion --help >/dev/null \
- && rm -rf /tmp/aetherion-src /root/.cache/uv
 
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-# Switch to the non-root user, set runtime env (HOME and per-tool dirs
-# that should land inside the user's namespace mount), and drop into an
-# interactive login shell. The CLI launcher overrides CMD as needed.
-#
-# Per-tool env that should live in the namespace:
-#   GOPATH/GOBIN  — runtime `go install` lands binaries in ~/go/bin;
-#                   module downloads land in ~/go/pkg/mod.
-#   BUN_INSTALL   — runtime `bun install -g <pkg>` puts globals under
-#                   ~/.bun (the bun binary itself is system-wide at
-#                   /usr/local/bin/bun via the symlink above).
+# Switch to the non-root user. Per-tool env that should live in the
+# namespace (so user-installed packages land there, not in image-baked
+# root-owned dirs):
+#   GOPATH/GOBIN — runtime `go install` lands binaries in ~/go/bin;
+#                  module downloads land in ~/go/pkg/mod.
+#   BUN_INSTALL  — runtime `bun install -g <pkg>` puts globals under
+#                  ~/.bun (the bun binary itself is system-wide at
+#                  /usr/local/bin/bun via the symlink above).
+#   CARGO_HOME   — `cargo install <crate>` lands user binaries in
+#                  ~/.cargo/bin. RUSTUP_HOME stays system-wide so the
+#                  baked stable toolchain is the default rustc;
+#                  user `rustup toolchain install` would need sudo,
+#                  which is the right default for a baked system tool.
 #   UV_PYTHON_INSTALL_DIR — runtime `uv` downloads Python interpreters
-#                   into ~/.local/share/uv/python so user-installed
-#                   tools don't try to write to /opt/uv-pythons (which
-#                   is image-baked and root-owned).
+#                  into ~/.local/share/uv/python so user-installed
+#                  tools don't try to write to /opt/uv-pythons (which
+#                  would be root-owned if it existed; it doesn't here).
 #
 # PATH puts user-scoped install dirs first so anything the user installs
-# at runtime takes precedence over the baked-in system versions if they
-# choose to override (e.g. `uv tool install -U aetherion`).
+# at runtime takes precedence over the baked-in system versions.
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 
@@ -766,10 +424,9 @@ ENV HOME=/home/${USERNAME} \
     GOPATH=/home/${USERNAME}/go \
     GOBIN=/home/${USERNAME}/go/bin \
     BUN_INSTALL=/home/${USERNAME}/.bun \
+    CARGO_HOME=/home/${USERNAME}/.cargo \
+    RUSTUP_HOME=/usr/local/rustup \
     UV_PYTHON_INSTALL_DIR=/home/${USERNAME}/.local/share/uv/python \
-    PATH=/home/${USERNAME}/go/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.npm-global/bin:/home/${USERNAME}/.bun/bin:/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/go/bin:/home/${USERNAME}/.local/bin:/home/${USERNAME}/.bun/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Default to an interactive login shell; the CLI launcher overrides as needed.
-# (No trailing `SHELL` directive — there are no RUN steps after this point for
-# it to influence, and OCI image format ignores it with a build-time warning.)
 CMD ["/bin/bash", "-l"]

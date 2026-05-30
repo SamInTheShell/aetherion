@@ -1,0 +1,13 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Language toolchain + every vendor CLI agent (Claude Code, Codex, Cursor Agent, Gemini, Copilot, Pi, openclaw, Hermes) + conduit."
+
+# Native on both Linux architectures: every agent ships either as
+# arch-agnostic Node/Python packages (gemini-cli, copilot, codex, pi,
+# openclaw, hermes-agent) or as multi-arch binaries (claude-code via
+# Anthropic's apt repo, cursor-agent via the cursor.com installer).
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }

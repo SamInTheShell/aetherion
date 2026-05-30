@@ -1,0 +1,210 @@
+"$schema" = 'https://starship.rs/config-schema.json'
+
+add_newline = false
+
+format = """[](fg:magenta)\
+$os\
+$username\
+$hostname\
+[](fg:magenta bg:cyan)\
+$directory\
+[](fg:cyan bg:lime)\
+$git_branch\
+$git_status\
+[](fg:lime bg:yellow)\
+$c\
+$rust\
+$golang\
+$nodejs\
+$php\
+$java\
+$kotlin\
+$haskell\
+$python\
+[](fg:yellow bg:pink)\
+$docker_context\
+[](fg:pink bg:orange)\
+$time\
+[ ](fg:orange)\
+$line_break$character"""
+
+palette = 'neon'
+
+[palettes.neon]
+# Pure black ink for text sitting on a neon background — every neon hue loses
+# contrast against itself, so a single dark foreground is the universal choice.
+ink     = "#000000"
+white   = "#ffffff"
+magenta = "#ff10d4"
+cyan    = "#00f0ff"
+lime    = "#39ff14"
+yellow  = "#faff00"
+orange  = "#ff6b00"
+pink    = "#ff2bd6"
+red     = "#ff2d55"
+
+[palettes.gruvbox_dark]
+color_fg0 = '#fbf1c7'
+color_bg1 = '#3c3836'
+color_bg3 = '#665c54'
+color_blue = '#458588'
+color_aqua = '#689d6a'
+color_green = '#98971a'
+color_orange = '#d65d0e'
+color_purple = '#b16286'
+color_red = '#cc241d'
+color_yellow = '#d79921'
+
+[palettes.catppuccin_mocha]
+rosewater = "#f5e0dc"
+flamingo = "#f2cdcd"
+pink = "#f5c2e7"
+orange = "#cba6f7"
+red = "#f38ba8"
+maroon = "#eba0ac"
+peach = "#fab387"
+yellow = "#f9e2af"
+green = "#a6e3a1"
+teal = "#94e2d5"
+sky = "#89dceb"
+sapphire = "#74c7ec"
+blue = "#89b4fa"
+lavender = "#b4befe"
+text = "#cdd6f4"
+subtext1 = "#bac2de"
+subtext0 = "#a6adc8"
+overlay2 = "#9399b2"
+overlay1 = "#7f849c"
+overlay0 = "#6c7086"
+surface2 = "#585b70"
+surface1 = "#45475a"
+surface0 = "#313244"
+base = "#1e1e2e"
+mantle = "#181825"
+crust = "#11111b"
+
+[os]
+disabled = false
+style = "bg:magenta fg:ink bold"
+
+[os.symbols]
+Windows = "󰍲"
+Ubuntu = "󰕈"
+SUSE = ""
+Raspbian = "󰐿"
+Mint = "󰣭"
+Macos = ""
+Manjaro = ""
+Linux = "󰌽"
+Gentoo = "󰣨"
+Fedora = "󰣛"
+Alpine = ""
+Amazon = ""
+Android = ""
+Arch = "󰣇"
+Artix = "󰣇"
+CentOS = ""
+Debian = "󰣚"
+Redhat = "󱄛"
+RedHatEnterprise = "󱄛"
+
+[username]
+show_always = true
+style_user = "bg:magenta fg:ink bold"
+style_root = "bg:magenta fg:ink bold"
+format = '[ $user]($style)'
+
+[hostname]
+ssh_only = false
+style = "bg:magenta fg:ink bold"
+format = '[@$hostname ]($style)'
+
+[directory]
+style = "fg:ink bg:cyan bold"
+format = "[ $path ]($style)"
+truncation_length = 0
+truncate_to_repo = false
+
+[directory.substitutions]
+"Documents" = "󰈙 "
+"Downloads" = " "
+"Music" = "󰝚 "
+"Pictures" = " "
+"Developer" = "󰲋 "
+
+[git_branch]
+symbol = ""
+style = "bg:lime fg:ink bold"
+format = '[[ $symbol $branch ](fg:ink bg:lime)]($style)'
+
+[git_status]
+style = "bg:lime fg:ink bold"
+format = '[[($all_status$ahead_behind )](fg:ink bg:lime)]($style)'
+
+[nodejs]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[c]
+symbol = " "
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[rust]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[golang]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[php]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[java]
+symbol = " "
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[kotlin]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[haskell]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[python]
+symbol = ""
+style = "bg:yellow fg:ink bold"
+format = '[[ $symbol( $version) ](fg:ink bg:yellow)]($style)'
+
+[docker_context]
+symbol = ""
+style = "bg:pink fg:ink bold"
+format = '[[ $symbol( $context) ](fg:ink bg:pink)]($style)'
+
+[time]
+disabled = false
+time_format = "%R"
+style = "bg:orange fg:ink bold"
+format = '[[  $time ](fg:ink bg:orange)]($style)'
+
+[line_break]
+disabled = false
+
+[character]
+disabled = false
+success_symbol = '[❯](bold fg:lime)'
+error_symbol = '[❯](bold fg:red)'
+vimcmd_symbol = '[](bold fg:lime)'
+vimcmd_replace_one_symbol = '[](bold fg:magenta)'
+vimcmd_replace_symbol = '[](bold fg:magenta)'
+vimcmd_visual_symbol = '[](bold fg:yellow)'

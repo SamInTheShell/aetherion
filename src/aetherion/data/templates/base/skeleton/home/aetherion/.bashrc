@@ -1,10 +1,11 @@
-# ~/.bashrc — aetherion dev container
+# ~/.bashrc — aetherion base template
 #
-# Sourced for interactive shells. /etc/skel/.profile (still in place from
-# useradd) handles the login-shell -> .bashrc handoff, so a `bash -l` startup
-# lands here too.
+# Minimal interactive-shell setup. Mirrors the conventions in
+# src/aetherion/data/templates/STYLE.md so the prompt + Ctrl-W feel
+# match every other baked-in template even though this image ships
+# almost nothing else.
 
-# Interactive guard — non-interactive shells bail out before doing any setup.
+# Interactive guard — non-interactive shells bail before any setup.
 case $- in
     *i*) ;;
       *) return;;
@@ -38,6 +39,6 @@ stty werase undef 2>/dev/null
 bind '"\C-w": backward-kill-word'
 
 # ---- starship prompt ----------------------------------------------------
-# Config lives at ~/.config/starship.toml (neon palette, shared across
+# Config lives at ~/.config/starship.toml (neon palette — shared across
 # every baked-in template per STYLE.md).
 eval "$(starship init bash)"

@@ -1,0 +1,40 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Microsoft VS Code (Electron, native amd64/arm64) with X11 forwarding."
+
+# Native on both architectures: Microsoft's apt repo serves linux-x64
+# and linux-arm64 .debs and the package is selected for the build
+# host's dpkg architecture at apt-install time. No emulation required
+# on either side.
+#
+# macOS hosts (Docker Desktop / podman-machine) run the container
+# inside a Linux VM. Display forwarding works via XQuartz over TCP —
+# the launcher's darwin display path sets
+# DISPLAY=host.docker.internal:0 and skips the Linux-only
+# socket/D-Bus/GPU plumbing. The launcher auto-configures XQuartz on
+# each `--display x11` (or `auto`) launch: flips
+# `org.xquartz.X11 nolisten_tcp` to false, restarts XQuartz if it had
+# to change the pref, and runs `xhost +localhost`. The only manual
+# step is `brew install --cask xquartz`; missing-XQuartz halts the
+# launch with that hint. The code wrapper picks up `/dev/dri` absence
+# at runtime and adds `--use-gl=angle --use-angle=swiftshader` so
+# Chromium's renderer survives the no-GPU XQuartz path.
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+
+# Per-namespace defaults applied at `create namespace` time. The
+# launcher writes these into the new namespace's config.yaml entry;
+# explicit CLI values still win.
+defaults:
+  display: x11
+  # Bare `aetherion vscode-ide` lands you in VS Code, not bash. Drop
+  # to a shell with `aetherion vscode-ide bash` (positional override)
+  # or `aetherion vscode-ide --command bash` (explicit flag).
+  command: code

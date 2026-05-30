@@ -1,10 +1,10 @@
-# ~/.bashrc — aetherion dev container
+# ~/.bashrc — aetherion nvim template
 #
 # Sourced for interactive shells. /etc/skel/.profile (still in place from
 # useradd) handles the login-shell -> .bashrc handoff, so a `bash -l` startup
 # lands here too.
 
-# Interactive guard — non-interactive shells bail out before doing any setup.
+# Interactive guard — non-interactive shells bail before any setup.
 case $- in
     *i*) ;;
       *) return;;

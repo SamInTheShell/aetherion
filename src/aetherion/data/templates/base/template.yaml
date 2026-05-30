@@ -1,0 +1,12 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Minimal aetherion shell: debian + starship + lsof/netstat. No toolchains."
+
+# Pure-bash starter image with no native dependencies of its own beyond
+# what's in debian:trixie-slim, so it builds and runs cleanly anywhere
+# Debian does — both architectures, podman and docker.
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }

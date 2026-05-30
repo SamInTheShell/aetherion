@@ -1,10 +1,10 @@
-# ~/.bashrc — aetherion dev container
+# ~/.bashrc — aetherion cli-agents template
 #
 # Sourced for interactive shells. /etc/skel/.profile (still in place from
 # useradd) handles the login-shell -> .bashrc handoff, so a `bash -l` startup
 # lands here too.
 
-# Interactive guard — non-interactive shells bail out before doing any setup.
+# Interactive guard — non-interactive shells bail before any setup.
 case $- in
     *i*) ;;
       *) return;;
@@ -36,6 +36,13 @@ fi
 # URLs and paths whole.
 stty werase undef 2>/dev/null
 bind '"\C-w": backward-kill-word'
+
+# ---- convenience aliases ------------------------------------------------
+# Muscle-memory shortcut: `cursor` is what people type for the Cursor
+# CLI agent. The actual binary is /usr/local/bin/agent (Cursor renamed
+# `cursor-agent` -> `agent`). cursor-agent stays symlinked too so any
+# scripts pinned to the old name keep working.
+alias cursor='agent'
 
 # ---- starship prompt ----------------------------------------------------
 # Config lives at ~/.config/starship.toml (neon palette, shared across
