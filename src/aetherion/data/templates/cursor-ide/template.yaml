@@ -1,0 +1,18 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Cursor IDE (Electron, native amd64/arm64) with X11 forwarding."
+
+# Native on both architectures: Cursor ships linux-x64 and linux-arm64
+# AppImages, and the Dockerfile selects the matching one at build time.
+# No emulation required on either side.
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }
+
+# Per-namespace defaults applied at `create namespace` time. The launcher
+# writes these into the new namespace's config.yaml entry; explicit CLI
+# values still win.
+defaults:
+  display: x11
