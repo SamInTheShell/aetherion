@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -1357,12 +1358,18 @@ def cmd_create(argv: list[str]) -> int:
     parser.add_argument("what", choices=("namespace", "template"))
     parser.add_argument("name", help="name to create")
     parser.add_argument(
-        "--template", metavar="SPEC", default=None,
+        "template", nargs="?", default=None,
         help=(
             "Template to fork from. Either a local template name "
             f"(default: {DEFAULT_TEMPLATE!r}) or a git URL with optional "
             "`#REF` (e.g. `https://example.com/foo.git#v1.0`)."
         ),
+    )
+    # Legacy flag form, kept for back-compat. The positional wins if both
+    # are given. dest differs from the positional so they don't collide.
+    parser.add_argument(
+        "--template", metavar="SPEC", dest="template_flag", default=None,
+        help="Deprecated alias for the positional TEMPLATE.",
     )
     parser.add_argument(
         "--no-cache", action="store_true",
@@ -1370,14 +1377,15 @@ def cmd_create(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
+    template = args.template or args.template_flag
     home = Path.home()
     if args.what == "namespace":
         return _create_namespace(
             home, args.name,
-            template=args.template,
+            template=template,
             no_cache=args.no_cache,
         )
-    return _create_template(home, args.name, base=args.template)
+    return _create_template(home, args.name, base=template)
 
 
 def _create_namespace(
@@ -1975,7 +1983,7 @@ _LAUNCH_VALUE_FLAGS: dict[str, str] = {
     "--display": "display",
     "--command": "command_override",
 }
-_LAUNCH_BOOL_FLAGS: frozenset[str] = frozenset({"--create"})
+_LAUNCH_BOOL_FLAGS: frozenset[str] = frozenset()
 _LAUNCH_OPTIONAL_VALUE_FLAGS: dict[str, str] = {
     "--forward-openclaw": "forward_openclaw",
 }
@@ -2026,8 +2034,25 @@ def _parse_launch_argv(argv: list[str]) -> tuple[str | None, list[str], LaunchOp
             i += 1
             continue
 
-        if tok in _LAUNCH_BOOL_FLAGS:
+        # --create optionally takes the template to fork from:
+        #   NS --create             → default template (bare switch)
+        #   NS --create vscode-ide  → fork from vscode-ide
+        #   NS --create=vscode-ide  → same, `=` form
+        # A following non-flag token is consumed as the template; to pass a
+        # trailing command instead, put it before --create or after `--`.
+        if head == "--create":
             options.create = True
+            if eq:
+                options.template = val
+                i += 1
+            elif i + 1 < n and not argv[i + 1].startswith("-"):
+                options.template = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if tok in _LAUNCH_BOOL_FLAGS:
             i += 1
             continue
 
@@ -2176,9 +2201,48 @@ def _xquartz_listening() -> bool:
         return False
 
 
+def _x11_probe(host: str = "127.0.0.1", port: int = 6000,
+               timeout: float = 5.0) -> str:
+    """Speak actual X11 to the server and report what it says. This is the only
+    honest readiness signal we have, and it needs no external tools.
+
+    A bare TCP connect is a false positive on macOS: launchd socket-activates
+    XQuartz, so the port accepts connections — and that accept is what *triggers*
+    the cold start — before the server can serve. So we send a real connection
+    setup request and read the reply byte:
+
+      "ok"      server replied Success — it is up *and* this host is authorized
+                with no auth cookie, which is exactly what the container needs.
+      "unauth"  server is up but refused us (Failed / Authenticate); the caller
+                should disable access control (`xhost +`) and probe again.
+      "down"    couldn't connect, or no reply yet — still starting.
+
+    Because launchd hands our connection to XQuartz once it spawns, the recv
+    blocks until the server is genuinely answering; a refused connect returns
+    "down" immediately. Either way the result reflects reality, not a guess."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return "down"
+    try:
+        sock.settimeout(timeout)
+        # Connection setup: little-endian ('l'), protocol 11.0, empty auth
+        # name + data. 12 bytes; the trailing two are pad.
+        sock.sendall(struct.pack("<BxHHHHxx", 0x6C, 11, 0, 0, 0))
+        reply = sock.recv(8)
+    except OSError:
+        return "down"
+    finally:
+        sock.close()
+    if not reply:
+        return "down"
+    # reply[0]: 0 = Failed, 1 = Success, 2 = Authenticate.
+    return "ok" if reply[0] == 1 else "unauth"
+
+
 def _xquartz_ensure_ready() -> bool:
     """Make XQuartz ready for the container: TCP listener enabled,
-    process running, localhost authorized via xhost. Returns True if
+    process running, access control disabled via xhost. Returns True if
     we end up in that state, False if any step failed (caller then
     falls back to the manual hint).
 
@@ -2186,8 +2250,10 @@ def _xquartz_ensure_ready() -> bool:
       1. `org.xquartz.X11 nolisten_tcp` == false — the network listener
          the Preferences → Security checkbox toggles.
       2. XQuartz process is running so the listener actually binds.
-      3. `xhost +localhost` so XQuartz accepts the container's
-         connection (which originates from the VM's NAT address).
+      3. `xhost +` (access control off) so XQuartz accepts the
+         container's connection. It arrives via host.docker.internal
+         from the VM's gateway/NAT address — not localhost, and it
+         changes each run — so a per-host grant can't cover it.
 
     Each step is a one-line command, but failing any of them leaves
     the user staring at "Missing X server" inside the container. Doing
@@ -2250,33 +2316,65 @@ def _xquartz_ensure_ready() -> bool:
             ["open", "-a", "XQuartz"],
             capture_output=True, timeout=10, check=False,
         )
-        # XQuartz cold-start is a couple of seconds; give it up to ~10.
-        for _ in range(40):
-            time.sleep(0.25)
-            if _xquartz_listening():
-                break
-        else:
-            return False
+        # Unconditional settle after a cold launch. The handshake probe below
+        # should make this unnecessary, but XQuartz's launchd socket activation
+        # has proven flaky enough on cold start that a fixed pause first is the
+        # pragmatic floor.
+        sys.stderr.write("aetherion: waiting 5s for XQuartz to start…\n")
+        time.sleep(5)
 
-    # Step 3 — authorization. The container's connection comes in from
-    # the VM's NAT address, which xhost has to allow. `+localhost` is
-    # the wide-open form; narrower (per-IP) auth doesn't help since
-    # that NAT address changes each container start. Safe under
-    # "trusted single-user dev machine" assumptions, which match the
-    # rest of aetherion's threat model.
-    #
-    # xhost lives at /opt/X11/bin/xhost, which isn't always on PATH.
-    # DISPLAY=:0 routes the call through XQuartz's unix socket; the
-    # socket is owned by the calling user and doesn't itself need
-    # xhost auth.
+    # Step 3 — readiness + authorization, in one loop below. xhost lives at
+    # /opt/X11/bin/xhost, which isn't always on PATH.
     xhost = shutil.which("xhost") or "/opt/X11/bin/xhost"
-    if Path(xhost).exists():
-        subprocess.run(
-            [xhost, "+localhost"],
-            capture_output=True, timeout=5, check=False,
-            env={**os.environ, "DISPLAY": ":0"},
-        )
-    return True
+
+    # Block until the server can actually serve the container, validated over
+    # the real TCP path (127.0.0.1:6000 — the same XQuartz listener the
+    # container reaches via host.docker.internal). The probe getting any reply
+    # means the server is *serving*, so the "Missing X server" race is won; we
+    # then disable access control so the container's connection is authorized,
+    # and hand off only once the probe confirms "ok". If the server never comes
+    # up we return False so the caller halts with a hint rather than launching
+    # a container that will just crash.
+    deadline = time.monotonic() + 30.0
+    granted = False
+    announced = False
+    while time.monotonic() < deadline:
+        status = _x11_probe("127.0.0.1")
+        if status == "ok":
+            # Server is up and our connection is authorized. Once access control
+            # is off (below), this is what the container's path looks like too.
+            return True
+        if status == "unauth":
+            # Server is serving but refusing unauthorized connections. The
+            # container connects through host.docker.internal, so XQuartz sees
+            # it arriving from the VM's gateway/NAT address — NOT localhost — and
+            # that address changes every run. `xhost +localhost` (or any per-host
+            # grant) therefore can't cover it; the only reliable fix is to
+            # disable access control entirely with bare `xhost +`. Safe under the
+            # "trusted single-user dev machine" assumption that the rest of
+            # aetherion's threat model already makes. DISPLAY=:0 routes this call
+            # through XQuartz's unix socket, usable by the owning user without
+            # prior auth.
+            if not granted and Path(xhost).exists():
+                subprocess.run(
+                    [xhost, "+"],
+                    capture_output=True, timeout=5, check=False,
+                    env={**os.environ, "DISPLAY": ":0"},
+                )
+                granted = True
+                continue  # re-probe; with access control off this reads "ok"
+            # xhost isn't available (or we already ran it and the server still
+            # reports unauth). It's serving, so hand off rather than stall —
+            # better a clear in-container X error than a false 30s timeout.
+            return True
+        # status == "down": still coming up.
+        if not announced:
+            sys.stderr.write("aetherion: waiting for XQuartz to be ready…\n")
+            announced = True
+        time.sleep(0.25)
+
+    sys.stderr.write("aetherion: XQuartz did not become ready within 30s.\n")
+    return False
 
 
 def _display_runtime_args_darwin(
@@ -2292,7 +2390,7 @@ def _display_runtime_args_darwin(
     Prereqs the user has to set up themselves, in this order: install
     XQuartz, launch it with "Allow connections from network clients"
     enabled (Preferences → Security; quit + relaunch for the listener
-    to actually bind), and `xhost +localhost` so XQuartz accepts the
+    to actually bind), and `xhost +` so XQuartz accepts the
     connection from the VM. We probe for each here; missing prereqs
     halt the launch with SystemExit(2) because `display: x11` is a
     committed declaration that the namespace needs X11, and silently
@@ -2340,8 +2438,8 @@ def _display_runtime_args_darwin(
         raise SystemExit(2)
 
     # Auto-configure XQuartz: enable the TCP listener, restart if
-    # needed, run `xhost +localhost`. Idempotent — silent when already
-    # in the right state.
+    # needed, disable access control with `xhost +`. Idempotent —
+    # silent when already in the right state.
     if not _xquartz_ensure_ready():
         # Auto-config bailed somewhere (osascript timeout, defaults
         # write failed, listener never came up). Fall back to the
@@ -2353,7 +2451,8 @@ def _display_runtime_args_darwin(
             "\"Allow connections from\n"
             "aetherion:     network clients\", then quit + relaunch "
             "XQuartz.\n"
-            "aetherion:   - In a macOS terminal: `xhost +localhost`.\n"
+            "aetherion:   - In a macOS terminal: `xhost +` (the container "
+            "connects from the VM's address, not localhost).\n"
             "aetherion:   - Verify: `lsof -iTCP:6000 -sTCP:LISTEN` "
             "should show XQuartz.\n"
             "aetherion: refusing to launch without the X server "
@@ -2361,8 +2460,21 @@ def _display_runtime_args_darwin(
         )
         raise SystemExit(2)
 
-    env = ["-e", "DISPLAY=host.docker.internal:0"]
-    return [], env, []
+    # Relocate Cursor/Electron's single-instance IPC socket off the
+    # bind-mounted namespace $HOME. On macOS that home is shared into the
+    # Linux VM over virtiofs/gRPC-FUSE, which doesn't support listen() on a
+    # unix socket — so Cursor's `<userDataPath>/<version>-main.sock` under
+    # ~/.config/Cursor dies at startup with "listen ENOTSUP: operation not
+    # supported on socket". VS Code/Cursor prefer $XDG_RUNTIME_DIR for that
+    # socket when it's set, so point it at a writable in-container tmpfs
+    # (same mechanism the Linux path uses for `vscode-*.sock`). mode=1777
+    # lets UID 1000 write there; podman's --tmpfs takes no uid=/gid=.
+    env = [
+        "-e", "DISPLAY=host.docker.internal:0",
+        "-e", f"XDG_RUNTIME_DIR={_CONTAINER_RUNTIME_DIR}",
+    ]
+    extra = ["--tmpfs", f"{_CONTAINER_RUNTIME_DIR}:rw,mode=1777"]
+    return [], env, extra
 
 
 def _display_runtime_args(mode: str) -> tuple[list[str], list[str], list[str]]:
@@ -2760,7 +2872,7 @@ def _print_help() -> None:
         "  aetherion                                       # launch the default namespace\n"
         "  aetherion NAMESPACE                             # launch into NAMESPACE (runs namespace's `command` or bash)\n"
         "  aetherion NAMESPACE COMMAND [ARG...]            # run COMMAND instead (positional override)\n"
-        "  aetherion NAMESPACE --create [--template SPEC]  # create NAMESPACE if missing, then launch\n"
+        "  aetherion NAMESPACE --create [TEMPLATE]         # create NAMESPACE if missing, then launch\n"
         "  aetherion NAMESPACE --join SESSION [CMD]        # exec into a running session\n"
         "\n"
         "Launch flag overrides (additive on top of the YAML config):\n"
@@ -2776,7 +2888,7 @@ def _print_help() -> None:
         "  aetherion config                                              # open ~/.aetherion/config.yaml in $EDITOR\n"
         "  aetherion list namespaces                                     # registered namespaces + image + template + seed\n"
         "  aetherion list sessions                                       # running aetherion containers\n"
-        "  aetherion create namespace NAME [--template SPEC] [--no-cache]\n"
+        "  aetherion create namespace NAME [TEMPLATE] [--no-cache]\n"
         "  aetherion rebuild namespace NAME [--no-cache] [--refresh-template | --template SPEC]\n"
         "  aetherion reset namespace NAME [--force]                      # wipe $HOME, re-seed from the image\n"
         "  aetherion delete namespace NAME [NAME...] [--force]           # remove $HOME, build dir, image, config entry\n"

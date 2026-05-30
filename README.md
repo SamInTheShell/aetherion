@@ -2,20 +2,38 @@
 
 A containerized development environment for AI coding agents.
 
-Ships a Debian dev container preloaded with the bundled agent CLIs (Claude
-Code, Cursor Agent, GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi,
-OpenClaw, Hermes), Neovim with LSP/DAP support, podman-in-podman, and
-toolchains for Python, Node, Go, Rust, and Ruby. Toolchains and agent
-binaries live system-wide in the image (under `/opt` and `/usr/local`),
-so image rebuilds deliver new versions to every workspace immediately.
-The `aetherion` launcher mounts the current directory inside the
-container and bind-mounts a host directory as `$HOME` — agent logins,
-shell history, and per-user tool state persist across sessions. Multiple
-independent **namespaces** (each its own `$HOME`, its own image, its own
-build dir) let you keep separate identities, model setups, or
-experiments side by side without cross-talk. A second CLI, `conduit`,
-ships alongside and points the agents at a model server running on your
-host (Ollama, LM Studio, or any OpenAI-compatible endpoint).
+Aetherion runs your editors, agent CLIs, and toolchains inside disposable,
+per-project **namespaces** — each its own `$HOME`, image, and build dir, so you
+can keep separate identities, model setups, or experiments side by side without
+cross-talk. The `aetherion` launcher mounts your current directory into the
+container and bind-mounts a host directory as `$HOME`, so agent logins, shell
+history, and per-user tool state persist across sessions. System tooling lives
+in the image (under `/opt` and `/usr/local`), so an image rebuild delivers new
+versions to a namespace immediately.
+
+Functionality is **carved into templates** by responsibility, so you only pay
+for what you use:
+
+- **`base`** — a bare Debian shell + prompt.
+- **`default`** — language toolchains (Python, Node, Go, Rust, Ruby, C/C++),
+  plus podman-in-container, `uv`, `bun`. Bootstrapped on first run.
+- **`nvim`** — `default` + Neovim 0.11.x + a full LSP/DAP stack.
+- **`cli-agents`** — `default` + every vendor agent CLI (Claude Code, Codex,
+  Copilot, Gemini, Pi, Cursor Agent, OpenClaw, Hermes) + the `conduit` bridge.
+- **`vscode-ide`** / **`cursor-ide`** — GUI IDEs (Electron) with X11 forwarding.
+
+A second CLI, **`conduit`** (shipped in the `cli-agents` template), points the
+agents at a model server running on your host (Ollama, LM Studio, or any
+OpenAI-compatible endpoint).
+
+## Documentation
+
+Full guides live in [`docs/`](docs/):
+
+- [Quick start](docs/quickstart.md) — install and get an agent or IDE running.
+- [Templates](docs/templates.md) — every built-in template and its quick-start.
+- [Custom templates](docs/custom-templates.md) — build and manage your own.
+- [Design: aetherion](docs/design/aetherion.md) · [Design: conduit](docs/design/conduit.md).
 
 ## Install
 
@@ -40,12 +58,23 @@ aetherion                                # first run bootstraps the 'default'
                                          # image, seeds $HOME, then enters)
 ```
 
-Inside the container, point agents at your host's model server:
+The `default` namespace is a language-toolchain baseline — no editor, no agent
+CLIs. To run AI agents, create a namespace from the `cli-agents` template (which
+ships the agents and `conduit`):
+
+```shell
+aetherion agents --create cli-agents     # create 'agents' from cli-agents, enter it
+```
+
+Then, inside that container, point agents at your host's model server:
 
 ```shell
 conduit set endpoint lmstudio   # or `ollama`, or a full http(s):// URL
 conduit launch pi               # pick a model in the TUI; pi launches against it
 ```
+
+See the [quick start guide](docs/quickstart.md) for the editor (`nvim`) and GUI
+IDE (`cursor-ide` / `vscode-ide`) paths.
 
 ## Using a local model server
 
@@ -89,17 +118,28 @@ namespace's `port-forwarding:` block in `~/.aetherion/config.yaml`.
 
 ## What's in the container
 
-Everything below is installed system-wide (under `/usr/local/bin` and
-`/opt`), so it's shared across every namespace and tracks the image
-version automatically. Per-user state — agent logins, npm globals,
-runtime `go install` binaries, nvim plugins, shell history — lives in
-the namespace's `$HOME`.
+Each template ships a different set of tooling, installed system-wide (under
+`/usr/local/bin` and `/opt`) so it's shared across the namespace and tracks the
+image version automatically. Per-user state — agent logins, npm globals, runtime
+`go install` binaries, nvim plugins, shell history — lives in the namespace's
+`$HOME`. By template:
 
-- **Launcher tooling**: `conduit` (endpoint configuration + integration launcher; ships with aetherion)
-- **Languages & runtimes**: Python (system + uv), Node.js LTS + bun, Go, Rust, Ruby, C/C++ toolchain
-- **Agent CLIs**: Claude Code, Cursor Agent (`agent`), GitHub Copilot CLI, Gemini CLI, OpenAI Codex, Pi, OpenClaw, Hermes
-- **Editor**: Neovim with bundled LSPs (`pyright`, `gopls`, `rust-analyzer`, `lua-language-server`, `typescript-language-server`, `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`, `js-debug-adapter`). Plugins (`Lazy.nvim`-managed) auto-install on first `nvim` launch in each namespace.
-- **CLI tools**: git, podman, tmux, starship, ripgrep, fd, fzf, jq, yq, posting, openssh-client
+- **`default`** (shared base of `nvim`/`cli-agents`): Python (system + uv),
+  Node.js LTS + bun, Go, Rust, Ruby, C/C++ toolchain; podman-in-container; git,
+  tmux, starship, ripgrep, fd, fzf, jq, yq, socat, openssh-client.
+- **`nvim`** adds Neovim 0.11.x with bundled LSPs (`pyright`, `gopls`,
+  `rust-analyzer`, `lua-language-server`, `typescript-language-server`,
+  `vim-language-server`) and DAPs (`debugpy`, `delve`, `codelldb`,
+  `js-debug-adapter`). Plugins (`Lazy.nvim`-managed) auto-install on first
+  `nvim` launch.
+- **`cli-agents`** adds the agent CLIs — Claude Code, OpenAI Codex, GitHub
+  Copilot CLI, Gemini CLI, Pi, Cursor Agent (`agent`), OpenClaw, Hermes — plus
+  the `conduit` bridge.
+- **`vscode-ide`** / **`cursor-ide`** ship the IDE (Electron), X11 client libs,
+  and Firefox-ESR for in-namespace OAuth — a lighter image without the agents or
+  LSP servers.
+
+See [docs/templates.md](docs/templates.md) for the complete breakdown.
 
 ## Namespaces
 
@@ -121,12 +161,12 @@ into Claude under `work` doesn't log you in under `play`, and the
 aetherion                                                    # bootstrap + launch the default namespace
 aetherion work                                               # launch into 'work' (must exist)
 aetherion work --create                                      # create 'work' from 'default', then launch
-aetherion work --create --template cursor-ide                # create from a different template
-aetherion work nvim                                          # run nvim instead of an interactive shell
+aetherion work --create cursor-ide                           # create from a different template
+aetherion work bash                                          # run a command instead of the default
 aetherion work --join aetherion-a1b2c3d4                     # exec into an already-running session
 
 aetherion create namespace work                              # explicit creation (without launching)
-aetherion create namespace work --template cursor-ide        # pick a different template
+aetherion create namespace work cursor-ide                   # pick a different template
 aetherion list namespaces                                    # see what's registered
 aetherion list sessions                                      # see running containers
 aetherion reset namespace work                               # wipe $HOME and re-seed from the image
@@ -161,10 +201,16 @@ A template is a `Dockerfile` + `skeleton/` + `aetherion-src/` bundle that
 `create namespace` forks into a namespace's build dir. Two layers
 participate, user winning on name collisions:
 
-- **Baked-in** ships inside the package at `src/aetherion/data/templates/<name>/`. Out of the box:
-  - `default` — the full dev image (every agent CLI, Neovim+LSPs, language toolchains).
-  - `cursor-ide` — Cursor IDE (Electron) with X11 forwarding into the host. The Dockerfile detects host arch at build time and pulls the matching native `linux-x64` or `linux-arm64` AppImage (no emulation on either side), and bundles Firefox-ESR so the OAuth sign-in round-trip stays entirely inside the namespace — no host browser or `cursor://` URL-handler setup required. Supports linux *and* darwin hosts: on darwin the launcher auto-configures XQuartz's TCP listener + `xhost`, and the cursor wrapper switches Chromium to ANGLE-via-SwiftShader (in-process software GL) so the renderer survives the docker-VM hop. Bare `aetherion cursor-ide` opens Cursor instead of bash (`defaults.command: cursor` in the template).
-- **User-defined** lives at `~/.aetherion/templates/<name>/`. Same shape; you write whatever Dockerfile you want.
+- **Baked-in** ship inside the package at `src/aetherion/data/templates/<name>/`.
+  Out of the box: `base`, `default`, `nvim`, `cli-agents`, `vscode-ide`, and
+  `cursor-ide`. Each is documented in full — with what it ships and its
+  quick-start commands — in [docs/templates.md](docs/templates.md). They're
+  carved up by responsibility (toolchains / editor / agents / GUI), and the
+  tiers are peers rather than a single stack, so a namespace only carries what
+  it needs.
+- **User-defined** live at `~/.aetherion/templates/<name>/`. Same shape; you
+  write whatever Dockerfile you want. See
+  [docs/custom-templates.md](docs/custom-templates.md).
 
 A user template of the same name as a baked-in one shadows it; deleting
 the user copy unshadows.
@@ -187,36 +233,41 @@ platforms:
   - { os: darwin, arch: arm64, runtime: podman }
 defaults:
   display: x11        # written into the namespace's config.yaml at create
-  command: cursor     # bare `aetherion <ns>` runs cursor instead of bash
+  command: cursor .   # bare `aetherion <ns>` runs `cursor .` instead of bash
 ```
 
 `defaults.command` accepts either a string (shlex-split into argv) or a
 list of strings (used verbatim, the way to spell argv elements that
-contain whitespace). Unset ⇒ the launcher falls through to the image's
-`CMD` (bash for every baked-in template).
+contain whitespace). It is **not** shell-expanded — use `.` (the launcher sets
+the container's working directory to your mounted project), not `${PWD}`. Unset
+⇒ the launcher falls through to the image's `CMD` (bash for every baked-in
+template).
 
-`create namespace --template <name>` validates the current host against
+`create namespace NAME <template>` validates the current host against
 `platforms:` and fails with a clear error if the combo isn't supported.
 Templates without a `template.yaml` skip the check entirely.
 
 ```shell
 aetherion list templates                                     # see what's available
 aetherion create template my-fork                            # fork from 'default' into ~/.aetherion/templates/my-fork/
-aetherion create template my-fork --template cursor-ide      # fork from a specific base
+aetherion create template my-fork cursor-ide                 # fork from a specific base
 aetherion edit template my-fork                              # open Dockerfile in $EDITOR
 aetherion edit template default                              # auto-forks the baked-in 'default' then opens it
 aetherion delete template my-fork                            # remove user copy (baked-in stays)
 ```
 
-`--template` also accepts a git URL with an optional `#REF` (tag, branch,
-or commit). The clone is cached at `~/.aetherion/template-cache/<hash>/`
+The template argument also accepts a git URL with an optional `#REF` (tag,
+branch, or commit). The clone is cached at `~/.aetherion/template-cache/<hash>/`
 keyed by URL, so subsequent uses just `git fetch` and re-checkout:
 
 ```shell
-aetherion create namespace experimental --template https://github.com/me/aetherion-template.git
-aetherion create namespace pinned       --template https://github.com/me/aetherion-template.git#v1.2.0
+aetherion create namespace experimental https://github.com/me/aetherion-template.git
+aetherion create namespace pinned       https://github.com/me/aetherion-template.git#v1.2.0
 aetherion rebuild namespace pinned --refresh-template        # re-fetch + re-fork
 ```
+
+(The older `--template SPEC` flag still works everywhere as a deprecated alias;
+the positional wins if both are given.)
 
 Each namespace records the template name (or URL) it was forked from in
 its `config.yaml` entry, so `list namespaces` shows it and
@@ -254,7 +305,7 @@ namespaces:
     image: "localhost/aetherion:work"
     buildDir: "~/.aetherion/containers/work/"
     template: "https://github.com/me/aetherion-template.git#v1.2.0"
-    command: cursor                                       # default when no trailing command; string (shlex-split) or list
+    command: cursor .                                     # default when no trailing command; string (shlex-split) or list
     environment:
       fromMap:
         FOO: BAR                                          # literal value
@@ -287,8 +338,8 @@ replace it. Use them for one-offs:
 | `--forward-openclaw [ADDR][:PORT]` | OpenClaw convenience — publishes container port 18789 *and* sets up the loopback bridge required to reach it. Bare = `127.0.0.1:18789`. |
 | `--display x11\|wayland\|auto\|none` | Override display forwarding for this launch. See **Display forwarding** below for what each mode mounts. |
 | `--command "CMD [ARG...]"` | Override the namespace's default command (shlex-split into argv). Resolution: positional `COMMAND [ARG...]` after the namespace wins first, then `--command`, then the namespace YAML's `command:` field, then the image's `CMD`. |
-| `--create` | Create the named namespace if it doesn't exist (then launch). |
-| `--template SPEC` | When paired with `--create`, fork from SPEC (local name or git URL[#REF]) instead of `default`. Ignored without `--create`. |
+| `--create [TEMPLATE]` | Create the named namespace if it doesn't exist (then launch). Optionally fork from `TEMPLATE` (local name or git URL[#REF]); defaults to `default`. |
+| `--template SPEC` | Deprecated alias for the `--create` template (the positional after `--create` is preferred). Ignored without `--create`. |
 | `--join SESSION` | `exec -it` into a running session (see `aetherion list sessions`). Drops at `bash` unless a trailing command is given. |
 
 `AETHERION_CONTAINER_RUNTIME=docker` overrides runtime auto-detection
@@ -327,9 +378,9 @@ in-namespace and don't depend on the host having `xdg-desktop-portal`
 configured.
 
 The baked-in `cursor-ide` template ships `display: x11` and
-`command: cursor` in its `template.yaml` defaults, so a namespace
-created from it gets X11 forwarding *and* opens Cursor on launch
-without any per-namespace config edits.
+`command: cursor .` in its `template.yaml` defaults, so a namespace
+created from it gets X11 forwarding *and* opens Cursor on the mounted
+project directory at launch without any per-namespace config edits.
 
 ### macOS host caveats
 
@@ -347,13 +398,18 @@ hosts and takes a separate code path:
   brew install --cask xquartz       # Homebrew: https://brew.sh
   ```
   Everything else — flipping `org.xquartz.X11 nolisten_tcp` to enable
-  the TCP listener, restarting XQuartz, and running `xhost +localhost`
-  to authorize the container — the launcher does on each `--display
-  x11` (or `auto` on darwin) launch. It's idempotent: a no-op when
+  the TCP listener, restarting XQuartz, waiting for it to actually
+  answer X11, and disabling access control with `xhost +` to authorize
+  the container — the launcher does on each `--display x11` (or `auto`
+  on darwin) launch. (`xhost +localhost` isn't enough: the container's
+  connection arrives from the VM's gateway/NAT address, not localhost,
+  and that address changes each run.) It's idempotent: a no-op when
   things are already set up, a one-line stderr note for each step it
   actually has to take. If XQuartz isn't installed, the launcher halts
   with a `brew install --cask xquartz` hint instead of dropping you
-  into a doomed cursor session.
+  into a doomed cursor session. The launcher also sets `XDG_RUNTIME_DIR`
+  to an in-container tmpfs so Cursor's single-instance socket lands off
+  the virtiofs `$HOME` (which can't `listen()` on a unix socket).
 - **`display: wayland`** — not supported (macOS has no Wayland
   compositor); the launcher warns and skips forwarding.
 - **D-Bus forwarding** — also skipped on darwin. Notifications,

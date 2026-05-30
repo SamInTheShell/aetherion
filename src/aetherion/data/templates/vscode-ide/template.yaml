@@ -34,7 +34,10 @@ platforms:
 # explicit CLI values still win.
 defaults:
   display: x11
-  # Bare `aetherion vscode-ide` lands you in VS Code, not bash. Drop
-  # to a shell with `aetherion vscode-ide bash` (positional override)
-  # or `aetherion vscode-ide --command bash` (explicit flag).
-  command: code
+  # Bare `aetherion vscode-ide` opens VS Code on the launch directory
+  # (`.` = the mounted workdir; the launcher sets the container's `-w`
+  # to your project dir, and `command:` is shlex-split with no env
+  # expansion, so `.` works where `${PWD}` would not). Drop to a shell
+  # with `aetherion vscode-ide bash` (positional override) or
+  # `aetherion vscode-ide --command bash` (explicit flag).
+  command: code .
