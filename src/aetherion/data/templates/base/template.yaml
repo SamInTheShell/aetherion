@@ -4,9 +4,15 @@ description: "Minimal aetherion shell: debian + starship + lsof/netstat. No tool
 
 # Pure-bash starter image with no native dependencies of its own beyond
 # what's in debian:trixie-slim, so it builds and runs cleanly anywhere
-# Debian does — both architectures, podman and docker.
+# Debian does — both architectures, podman and docker, on Linux and on
+# darwin (Docker Desktop / podman-machine run Linux containers inside
+# their VM).
 platforms:
-  - { os: linux, arch: amd64, runtime: podman }
-  - { os: linux, arch: amd64, runtime: docker }
-  - { os: linux, arch: arm64, runtime: podman }
-  - { os: linux, arch: arm64, runtime: docker }
+  - { os: linux,  arch: amd64, runtime: podman }
+  - { os: linux,  arch: amd64, runtime: docker }
+  - { os: linux,  arch: arm64, runtime: podman }
+  - { os: linux,  arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }

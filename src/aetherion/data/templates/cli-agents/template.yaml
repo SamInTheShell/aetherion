@@ -2,12 +2,19 @@
 
 description: "Language toolchain + every vendor CLI agent (Claude Code, Codex, Cursor Agent, Gemini, Copilot, Pi, openclaw, Hermes) + conduit."
 
-# Native on both Linux architectures: every agent ships either as
+# Native on both architectures: every agent ships either as
 # arch-agnostic Node/Python packages (gemini-cli, copilot, codex, pi,
 # openclaw, hermes-agent) or as multi-arch binaries (claude-code via
 # Anthropic's apt repo, cursor-agent via the cursor.com installer).
+# Runs on darwin too — Docker Desktop / podman-machine host the
+# Linux container inside their VM, and every layer here (apt
+# packages, npm packages, Python wheels) is multi-arch Linux.
 platforms:
-  - { os: linux, arch: amd64, runtime: podman }
-  - { os: linux, arch: amd64, runtime: docker }
-  - { os: linux, arch: arm64, runtime: podman }
-  - { os: linux, arch: arm64, runtime: docker }
+  - { os: linux,  arch: amd64, runtime: podman }
+  - { os: linux,  arch: amd64, runtime: docker }
+  - { os: linux,  arch: arm64, runtime: podman }
+  - { os: linux,  arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
