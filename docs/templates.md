@@ -294,6 +294,14 @@ vanilla VS Code-fork defaults. Settings keys mirror upstream VS Code.
 **Use it when** you want Google's agentic IDE with namespace isolation. Same
 Linux/macOS support and the same XQuartz path on macOS as `vscode-ide`.
 
+### Issues with MacOS (XQuartz)
+
+During testing, it was not possible to resize or move the window.
+
+On multi-monitor setups, it launched mostly off screen.
+
+The decision was not to tailor aetherion to fix this, the solution belongs to XQuartz or Antigravity.
+
 ---
 
 ## Listing and choosing
