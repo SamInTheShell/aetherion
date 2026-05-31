@@ -13,8 +13,8 @@ CLI, **conduit**, that points agent CLIs at a model server on your host.
 ## Guides
 
 - **[Templates](templates.md)** — every built-in template (`base`, `default`,
-  `nvim`, `cli-agents`, `vscode-ide`, `cursor-ide`), what each ships, and the
-  quick-start commands for each.
+  `nvim`, `cli-agents`, `vscode-ide`, `cursor-ide`, `zed-ide`,
+  `antigravity-ide`), what each ships, and the quick-start commands for each.
 - **[Custom templates](custom-templates.md)** — fork, edit, and manage your own
   templates; share them via git; pick the right base to build on.
 

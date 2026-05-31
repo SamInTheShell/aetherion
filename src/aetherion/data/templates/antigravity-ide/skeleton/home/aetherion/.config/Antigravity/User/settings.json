@@ -1,0 +1,44 @@
+// Default Antigravity settings for aetherion antigravity-ide namespaces.
+//
+// Seed file (skeleton dotfile per STYLE.md): copied into the
+// namespace's $HOME on first launch and frozen there. Edits the user
+// makes inside the namespace win; rebuilding the image does NOT
+// refresh this file (use `aetherion reset namespace <name>` if you
+// want to drop user changes and reseed).
+//
+// Antigravity is a VS Code / Code-OSS fork — settings keys mirror
+// upstream VS Code, read from ~/.config/Antigravity/User/settings.json
+// (the "Antigravity" capitalization is what the .deb's product name
+// resolves to on Linux). Project-level overrides at
+// <project>/.vscode/settings.json still apply on top.
+//
+// Three intentional defaults — everything else stays at upstream:
+//
+//   - telemetry.telemetryLevel: "off"
+//       Antigravity inherits VS Code's telemetry pipeline AND ships
+//       Google's own usage reporting on top (Cascade sessions,
+//       agent-tool invocations). Aetherion namespaces are ephemeral
+//       build sandboxes; both pings would just be noise. Opt back in
+//       per-namespace if you want.
+//
+//   - update.mode: "none"
+//   - update.showReleaseNotes: false
+//       Image-managed install via the apt repo. In-namespace updates
+//       would either fail (no apt-get from the unprivileged user) or
+//       drift the install away from the pinned image build. Refresh
+//       by rebuilding the image with a newer ANTIGRAVITY_VERSION
+//       build arg (or unpinning to track the apt repo's latest).
+//
+//   - extensions.autoUpdate: false
+//   - extensions.autoCheckUpdates: false
+//       Same rationale: extensions live in $HOME and survive
+//       rebuilds, but silent background updates while you're working
+//       drag in network and surface unexpected breakage. Use the
+//       Extensions view to update on demand.
+{
+  "telemetry.telemetryLevel": "off",
+  "update.mode": "none",
+  "update.showReleaseNotes": false,
+  "extensions.autoUpdate": false,
+  "extensions.autoCheckUpdates": false
+}

@@ -22,6 +22,8 @@ for what you use:
   Copilot, Gemini, Pi, Cursor Agent, OpenClaw, Hermes) + the `conduit` bridge.
 - **`vscode-ide`** / **`cursor-ide`** — GUI IDEs (Electron) with X11 forwarding.
 - **`zed-ide`** — Zed (native Rust GPU editor) with X11 forwarding; ACP-ready.
+- **`antigravity-ide`** — Google Antigravity (Electron VS Code fork + bundled
+  Cascade Gemini agent) with X11 forwarding.
 
 A second CLI, **`conduit`** (shipped in the `cli-agents` template), points the
 agents at a model server running on your host (Ollama, LM Studio, or any
@@ -75,7 +77,7 @@ conduit launch pi               # pick a model in the TUI; pi launches against i
 ```
 
 See the [quick start guide](docs/quickstart.md) for the editor (`nvim`) and GUI
-IDE (`cursor-ide` / `vscode-ide` / `zed-ide`) paths.
+IDE (`cursor-ide` / `vscode-ide` / `zed-ide` / `antigravity-ide`) paths.
 
 ## Using a local model server
 
@@ -145,6 +147,12 @@ image version automatically. Per-user state — agent logins, npm globals, runti
   install is image-managed); panels arranged as `files | editor | chat` with
   the project tree pinned left and the agent / git / outline panels pinned
   right.
+- **`antigravity-ide`** ships Google Antigravity (Electron, VS Code fork)
+  from Google's signed apt repo, the same Electron/X11 runtime as
+  `vscode-ide`, `libsecret-1-0` for credential keyring, and Firefox-ESR for
+  in-namespace OAuth. Defaults: telemetry off, auto-update + extension
+  auto-update disabled. The Cascade Gemini agent is in-tree; sign-in needs a
+  Google account.
 
 See [docs/templates.md](docs/templates.md) for the complete breakdown.
 
@@ -210,11 +218,11 @@ participate, user winning on name collisions:
 
 - **Baked-in** ship inside the package at `src/aetherion/data/templates/<name>/`.
   Out of the box: `base`, `default`, `nvim`, `cli-agents`, `vscode-ide`,
-  `cursor-ide`, and `zed-ide`. Each is documented in full — with what it ships
-  and its quick-start commands — in [docs/templates.md](docs/templates.md).
-  They're carved up by responsibility (toolchains / editor / agents / GUI),
-  and the tiers are peers rather than a single stack, so a namespace only
-  carries what it needs.
+  `cursor-ide`, `zed-ide`, and `antigravity-ide`. Each is documented in full —
+  with what it ships and its quick-start commands — in
+  [docs/templates.md](docs/templates.md). They're carved up by responsibility
+  (toolchains / editor / agents / GUI), and the tiers are peers rather than a
+  single stack, so a namespace only carries what it needs.
 - **User-defined** live at `~/.aetherion/templates/<name>/`. Same shape; you
   write whatever Dockerfile you want. See
   [docs/custom-templates.md](docs/custom-templates.md).

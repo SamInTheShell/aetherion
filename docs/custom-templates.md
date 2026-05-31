@@ -37,7 +37,7 @@ Fork from the tier closest to what you want, then add the rest:
 | A multi-language build env | `default` | your deps |
 | **An editor in the ecosystem** | **`nvim`** | your deps / config |
 | Agents + an editor together | `cli-agents` | layer `nvim`'s editor bits |
-| A GUI IDE variant | `cursor-ide` / `vscode-ide` / `zed-ide` | extensions, settings |
+| A GUI IDE variant | `cursor-ide` / `vscode-ide` / `zed-ide` / `antigravity-ide` | extensions, settings |
 
 **If you want an editor inside an aetherion namespace, build on the bundled
 `nvim` template.** It already wires Neovim 0.11.x with a complete LSP/DAP stack

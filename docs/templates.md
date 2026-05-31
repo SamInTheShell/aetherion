@@ -1,7 +1,7 @@
 # Templates
 
 A **template** is a `Dockerfile` + `skeleton/` + `aetherion-src/` bundle that
-`create namespace` forks into a namespace's build dir. Aetherion ships seven
+`create namespace` forks into a namespace's build dir. Aetherion ships eight
 built-in templates, carved up by responsibility so you only pay for what you
 use:
 
@@ -14,12 +14,14 @@ use:
 | [`vscode-ide`](#vscode-ide) | GUI | `code .` | Microsoft VS Code (Electron) with X11 forwarding. |
 | [`cursor-ide`](#cursor-ide) | GUI | `cursor .` | Cursor IDE (Electron) with X11 forwarding. |
 | [`zed-ide`](#zed-ide) | GUI | `zed .` | Zed (native Rust GPU editor) with X11 forwarding + ACP-ready. |
+| [`antigravity-ide`](#antigravity-ide) | GUI | `antigravity .` | Google Antigravity (Electron VS Code fork + bundled Cascade Gemini agent) with X11 forwarding. |
 
 **Layering principle.** The tiers are *peers*, not a stack. `nvim`, `cli-agents`,
-and the three IDEs each build on the same language-toolchain base as `default`;
-the IDEs are deliberately lighter (no agents, no LSP servers). Editors and
-agents are orthogonal — run them in separate namespaces and switch between them,
-or fork a template to combine them (see [custom templates](custom-templates.md)).
+and the four IDEs each build on the same language-toolchain base as `default`;
+the IDEs are deliberately lighter (no agents, no LSP servers — except where the
+IDE itself bundles them). Editors and agents are orthogonal — run them in
+separate namespaces and switch between them, or fork a template to combine them
+(see [custom templates](custom-templates.md)).
 
 All templates share the same identity contract (user `aetherion`, UID 1000,
 `$HOME=/home/aetherion`, starship prompt) and support both `amd64` and `arm64`,
@@ -244,6 +246,53 @@ agent installs in.
 support and the same XQuartz path on macOS as the Electron IDEs — though
 Vulkan-over-XQuartz via lavapipe is slower than ANGLE/SwiftShader for the
 Electron apps, so on macOS the Electron templates currently feel snappier.
+
+---
+
+## antigravity-ide
+
+> Google Antigravity (Electron VS Code fork with bundled Cascade Gemini agent, native amd64/arm64) with X11 forwarding.
+
+```shell
+aetherion ide --create antigravity-ide   # create 'ide' from antigravity-ide, open Antigravity
+aetherion ide                            # re-enter (opens `antigravity .`)
+aetherion ide bash                       # drop to a shell instead
+```
+
+Structurally identical to [`vscode-ide`](#vscode-ide) — Antigravity is Google's
+VS Code / Code-OSS fork, with the same Electron/Chromium runtime and the same
+`/usr/share/<name>/<binary>` install layout the .deb plants. Same X11 plumbing,
+same `--use-gl=angle --use-angle=swiftshader` no-GPU wrapper fallback, same
+bundled Firefox-ESR for in-namespace OAuth (here routing `antigravity://`
+callbacks).
+
+What's different is what's baked into the IDE itself: Antigravity ships with
+Google's **Cascade** agent in-tree (no extension install needed), with Gemini
+3.x Pro/Flash as the primary model and Claude / gpt-oss as alternates. The
+agent surface needs a Google account to function — the editor itself works
+without one. There's a separate `agy` terminal CLI Google ships; it's not
+pre-installed here (run the upstream install line if you want it).
+
+- Antigravity from Google's signed apt repo at
+  `us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev` (native
+  per-arch). Pin a version with the `ANTIGRAVITY_VERSION` build arg, or leave
+  unset to track the apt channel.
+- Electron/Chromium runtime libs, X11 client libs, fonts, `libsecret-1-0` for
+  keyring-backed credential persistence.
+- Firefox-ESR so the Google sign-in / Cascade auth flow completes inside the
+  namespace (`antigravity://` callbacks route back to the in-container IDE).
+
+**Default Antigravity settings** (skeleton at
+`~/.config/Antigravity/User/settings.json`): telemetry off
+(`telemetry.telemetryLevel: "off"` — covers both VS Code's telemetry pipeline
+and Antigravity's own usage reporting on top), auto-update disabled
+(`update.mode: "none"`), extension auto-update disabled. Everything else is
+vanilla VS Code-fork defaults. Settings keys mirror upstream VS Code.
+
+`template.yaml` sets `display: x11` and `command: antigravity .`.
+
+**Use it when** you want Google's agentic IDE with namespace isolation. Same
+Linux/macOS support and the same XQuartz path on macOS as `vscode-ide`.
 
 ---
 
