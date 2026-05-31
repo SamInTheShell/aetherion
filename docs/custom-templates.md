@@ -37,7 +37,7 @@ Fork from the tier closest to what you want, then add the rest:
 | A multi-language build env | `default` | your deps |
 | **An editor in the ecosystem** | **`nvim`** | your deps / config |
 | Agents + an editor together | `cli-agents` | layer `nvim`'s editor bits |
-| A GUI IDE variant | `cursor-ide` / `vscode-ide` | extensions, settings |
+| A GUI IDE variant | `cursor-ide` / `vscode-ide` / `zed-ide` / `antigravity-ide` | extensions, settings |
 
 **If you want an editor inside an aetherion namespace, build on the bundled
 `nvim` template.** It already wires Neovim 0.11.x with a complete LSP/DAP stack
@@ -45,7 +45,8 @@ Fork from the tier closest to what you want, then add the rest:
 debugpy, delve, codelldb, js-debug-adapter) on top of the language toolchains,
 and it bootstraps plugins on first launch. Forking `nvim` gets you a fully
 working editor for free; you only add your project-specific dependencies. Reach
-for the GUI IDE templates only when you specifically want an Electron GUI.
+for the GUI IDE templates only when you specifically want a GUI editor (Electron
+for `cursor-ide` / `vscode-ide`, native Rust + Vulkan for `zed-ide`).
 
 ## Editing a template
 

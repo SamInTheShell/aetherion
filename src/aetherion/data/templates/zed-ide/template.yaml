@@ -1,0 +1,51 @@
+# Per-template metadata. Schema lives in src/aetherion/data/templates/STYLE.md.
+
+description: "Zed (native Rust GPU editor, native amd64/arm64) with X11 forwarding."
+
+# Native on both architectures: cloud.zed.dev serves linux-x64
+# (x86_64) and linux-arm64 (aarch64) tarballs and the Dockerfile
+# selects the matching one at build time. No emulation required on
+# either side.
+#
+# macOS hosts (Docker Desktop / podman-machine) run the container
+# inside a Linux VM. Display forwarding works via XQuartz over TCP —
+# the launcher's darwin display path sets
+# DISPLAY=host.docker.internal:0 and skips the Linux-only
+# socket/D-Bus/GPU plumbing. The launcher auto-configures XQuartz on
+# each `--display x11` (or `auto`) launch: flips
+# `org.xquartz.X11 nolisten_tcp` to false, restarts XQuartz if it had
+# to change the pref, and runs `xhost +`. The only manual step is
+# `brew install --cask xquartz`; missing-XQuartz halts the launch
+# with that hint.
+#
+# Zed paints via Vulkan, not GLX, so the XQuartz/no-GPU story is
+# different from the Electron IDE templates: there's no
+# `--use-gl=angle` wrapper trick. Instead the zed wrapper detects
+# /dev/dri absence and exports ZED_ALLOW_EMULATED_GPU=1 so Zed
+# accepts the Mesa lavapipe software ICD (shipped in the image via
+# mesa-vulkan-drivers). On macOS via XQuartz this means CPU-rendered
+# everything — usable for editing, but noticeably slower than a real
+# GPU. Linux hosts with /dev/dri bound at runtime keep the hardware
+# Vulkan path (radv for AMD, iris for Intel, ...).
+platforms:
+  - { os: linux, arch: amd64, runtime: podman }
+  - { os: linux, arch: amd64, runtime: docker }
+  - { os: linux, arch: arm64, runtime: podman }
+  - { os: linux, arch: arm64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: docker }
+  - { os: darwin, arch: amd64, runtime: podman }
+  - { os: darwin, arch: arm64, runtime: docker }
+  - { os: darwin, arch: arm64, runtime: podman }
+
+# Per-namespace defaults applied at `create namespace` time. The
+# launcher writes these into the new namespace's config.yaml entry;
+# explicit CLI values still win.
+defaults:
+  display: x11
+  # Bare `aetherion zed-ide` opens Zed on the launch directory
+  # (`.` = the mounted workdir; the launcher sets the container's `-w`
+  # to your project dir, and `command:` is shlex-split with no env
+  # expansion, so `.` works where `${PWD}` would not). Drop to a shell
+  # with `aetherion zed-ide bash` (positional override) or
+  # `aetherion zed-ide --command bash` (explicit flag).
+  command: zed .

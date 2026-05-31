@@ -1,7 +1,7 @@
 # Templates
 
 A **template** is a `Dockerfile` + `skeleton/` + `aetherion-src/` bundle that
-`create namespace` forks into a namespace's build dir. Aetherion ships six
+`create namespace` forks into a namespace's build dir. Aetherion ships eight
 built-in templates, carved up by responsibility so you only pay for what you
 use:
 
@@ -13,12 +13,15 @@ use:
 | [`cli-agents`](#cli-agents) | agents | `bash` | `default` + every vendor agent CLI + `conduit`. |
 | [`vscode-ide`](#vscode-ide) | GUI | `code .` | Microsoft VS Code (Electron) with X11 forwarding. |
 | [`cursor-ide`](#cursor-ide) | GUI | `cursor .` | Cursor IDE (Electron) with X11 forwarding. |
+| [`zed-ide`](#zed-ide) | GUI | `zed .` | Zed (native Rust GPU editor) with X11 forwarding + ACP-ready. |
+| [`antigravity-ide`](#antigravity-ide) | GUI | `antigravity .` | Google Antigravity (Electron VS Code fork + bundled Cascade Gemini agent) with X11 forwarding. |
 
 **Layering principle.** The tiers are *peers*, not a stack. `nvim`, `cli-agents`,
-and the two IDEs each build on the same language-toolchain base as `default`;
-the IDEs are deliberately lighter (no agents, no LSP servers). Editors and
-agents are orthogonal — run them in separate namespaces and switch between them,
-or fork a template to combine them (see [custom templates](custom-templates.md)).
+and the four IDEs each build on the same language-toolchain base as `default`;
+the IDEs are deliberately lighter (no agents, no LSP servers — except where the
+IDE itself bundles them). Editors and agents are orthogonal — run them in
+separate namespaces and switch between them, or fork a template to combine them
+(see [custom templates](custom-templates.md)).
 
 All templates share the same identity contract (user `aetherion`, UID 1000,
 `$HOME=/home/aetherion`, starship prompt) and support both `amd64` and `arm64`,
@@ -184,6 +187,120 @@ Firefox-ESR for `cursor://` OAuth callbacks.
 
 **Use it when** you want Cursor's agentic IDE with namespace isolation. Same
 Linux/macOS support and the same XQuartz path on macOS as `vscode-ide`.
+
+---
+
+## zed-ide
+
+> Zed (native Rust GPU editor, native amd64/arm64) with X11 forwarding.
+
+```shell
+aetherion ide --create zed-ide       # create 'ide' from zed-ide, open Zed
+aetherion ide                        # re-enter (opens `zed .`)
+aetherion ide bash                   # drop to a shell instead
+```
+
+Different shape from [`vscode-ide`](#vscode-ide) / [`cursor-ide`](#cursor-ide):
+those are Electron (Chromium) apps with a fat libgtk/libnss/libgbm runtime and
+a `--use-gl=angle` wrapper trick for the no-GPU case. Zed is a native Rust app
+that paints via Vulkan, so the dep set is different and the no-GPU fallback is
+Mesa's `lavapipe` software ICD (shipped in `mesa-vulkan-drivers`) with
+`ZED_ALLOW_EMULATED_GPU=1` exported by the wrapper when `/dev/dri` is absent.
+
+- Zed from the official `cloud.zed.dev` tarball (native per-arch, extracted to
+  `/opt/zed.app/`). Channel + version pinnable via `ZED_CHANNEL` and
+  `ZED_VERSION` build args.
+- Vulkan loader + Mesa ICDs (hardware on Linux with `/dev/dri`, lavapipe
+  software fallback on macOS/XQuartz).
+- X11 client libs, fonts, Firefox-ESR for in-namespace OAuth.
+
+**Default Zed settings** (skeleton at `~/.config/zed/settings.json`):
+
+- Sign-in button hidden, telemetry (diagnostics + metrics) off, auto-update
+  disabled (rebuild the image to refresh Zed).
+- **Three-column layout**: file tree pinned to the left (`project_panel.dock:
+  "left"` — Zed defaults to right), agent / threads / chat panel pinned to the
+  right (`agent.dock: "right"` and `agent.sidebar_side: "right"` so the inner
+  thread list hugs the window edge). Git and outline panels also dock right
+  for a consistent "files left, everything else right" split.
+
+Auto-opening the agent panel on first launch isn't settings-controllable yet
+(only `project_panel` has a `starts_open` key — see Zed issue [#51542](https://github.com/zed-industries/zed/issues/51542));
+open it once with `ctrl-?` and Zed's default `restore_on_startup: "last_session"`
+keeps it open on subsequent launches into the same namespace.
+
+Everything else is Zed's vanilla defaults. Flip any of them back per-namespace
+if you want.
+
+**Agent CLIs (ACP)**: Zed's Agent Panel can talk to Claude Code, Gemini,
+Codex, Copilot, and other ACP agents. None of those CLIs are pre-installed
+here — Zed's first-use download path lands them in `~/.local/share/zed/` in
+the namespace, which persists across launches. If you want them on PATH
+system-wide instead (and `conduit` to wire them at a local model), use a
+separate [`cli-agents`](#cli-agents) namespace, or fork zed-ide to layer the
+agent installs in.
+
+`template.yaml` sets `display: x11` and `command: zed .`.
+
+**Use it when** you want Zed with namespace isolation. Same Linux/macOS
+support and the same XQuartz path on macOS as the Electron IDEs — though
+Vulkan-over-XQuartz via lavapipe is slower than ANGLE/SwiftShader for the
+Electron apps, so on macOS the Electron templates currently feel snappier.
+
+---
+
+## antigravity-ide
+
+> Google Antigravity (Electron VS Code fork with bundled Cascade Gemini agent, native amd64/arm64) with X11 forwarding.
+
+```shell
+aetherion ide --create antigravity-ide   # create 'ide' from antigravity-ide, open Antigravity
+aetherion ide                            # re-enter (opens `antigravity .`)
+aetherion ide bash                       # drop to a shell instead
+```
+
+Structurally identical to [`vscode-ide`](#vscode-ide) — Antigravity is Google's
+VS Code / Code-OSS fork, with the same Electron/Chromium runtime and the same
+`/usr/share/<name>/<binary>` install layout the .deb plants. Same X11 plumbing,
+same `--use-gl=angle --use-angle=swiftshader` no-GPU wrapper fallback, same
+bundled Firefox-ESR for in-namespace OAuth (here routing `antigravity://`
+callbacks).
+
+What's different is what's baked into the IDE itself: Antigravity ships with
+Google's **Cascade** agent in-tree (no extension install needed), with Gemini
+3.x Pro/Flash as the primary model and Claude / gpt-oss as alternates. The
+agent surface needs a Google account to function — the editor itself works
+without one. There's a separate `agy` terminal CLI Google ships; it's not
+pre-installed here (run the upstream install line if you want it).
+
+- Antigravity from Google's signed apt repo at
+  `us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev` (native
+  per-arch). Pin a version with the `ANTIGRAVITY_VERSION` build arg, or leave
+  unset to track the apt channel.
+- Electron/Chromium runtime libs, X11 client libs, fonts, `libsecret-1-0` for
+  keyring-backed credential persistence.
+- Firefox-ESR so the Google sign-in / Cascade auth flow completes inside the
+  namespace (`antigravity://` callbacks route back to the in-container IDE).
+
+**Default Antigravity settings** (skeleton at
+`~/.config/Antigravity/User/settings.json`): telemetry off
+(`telemetry.telemetryLevel: "off"` — covers both VS Code's telemetry pipeline
+and Antigravity's own usage reporting on top), auto-update disabled
+(`update.mode: "none"`), extension auto-update disabled. Everything else is
+vanilla VS Code-fork defaults. Settings keys mirror upstream VS Code.
+
+`template.yaml` sets `display: x11` and `command: antigravity .`.
+
+**Use it when** you want Google's agentic IDE with namespace isolation. Same
+Linux/macOS support and the same XQuartz path on macOS as `vscode-ide`.
+
+### Issues with MacOS (XQuartz)
+
+During testing, it was not possible to resize or move the window.
+
+On multi-monitor setups, it launched mostly off screen.
+
+The decision was not to tailor aetherion to fix this, the solution belongs to XQuartz or Antigravity.
 
 ---
 
