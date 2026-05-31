@@ -17,6 +17,9 @@ CLI, **conduit**, that points agent CLIs at a model server on your host.
   `antigravity-ide`), what each ships, and the quick-start commands for each.
 - **[Custom templates](custom-templates.md)** — fork, edit, and manage your own
   templates; share them via git; pick the right base to build on.
+- **[Security model](security.md)** — what the container boundary gives you and
+  where it stops; network, filesystem, and display exposure; platform
+  differences (Linux, gVisor, macOS).
 
 ## Design
 
