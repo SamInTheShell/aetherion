@@ -1,7 +1,7 @@
 # Templates
 
 A **template** is a `Dockerfile` + `skeleton/` + `aetherion-src/` bundle that
-`create namespace` forks into a namespace's build dir. Aetherion ships six
+`create namespace` forks into a namespace's build dir. Aetherion ships seven
 built-in templates, carved up by responsibility so you only pay for what you
 use:
 
@@ -13,9 +13,10 @@ use:
 | [`cli-agents`](#cli-agents) | agents | `bash` | `default` + every vendor agent CLI + `conduit`. |
 | [`vscode-ide`](#vscode-ide) | GUI | `code .` | Microsoft VS Code (Electron) with X11 forwarding. |
 | [`cursor-ide`](#cursor-ide) | GUI | `cursor .` | Cursor IDE (Electron) with X11 forwarding. |
+| [`zed-ide`](#zed-ide) | GUI | `zed .` | Zed (native Rust GPU editor) with X11 forwarding + ACP-ready. |
 
 **Layering principle.** The tiers are *peers*, not a stack. `nvim`, `cli-agents`,
-and the two IDEs each build on the same language-toolchain base as `default`;
+and the three IDEs each build on the same language-toolchain base as `default`;
 the IDEs are deliberately lighter (no agents, no LSP servers). Editors and
 agents are orthogonal — run them in separate namespaces and switch between them,
 or fork a template to combine them (see [custom templates](custom-templates.md)).
@@ -184,6 +185,65 @@ Firefox-ESR for `cursor://` OAuth callbacks.
 
 **Use it when** you want Cursor's agentic IDE with namespace isolation. Same
 Linux/macOS support and the same XQuartz path on macOS as `vscode-ide`.
+
+---
+
+## zed-ide
+
+> Zed (native Rust GPU editor, native amd64/arm64) with X11 forwarding.
+
+```shell
+aetherion ide --create zed-ide       # create 'ide' from zed-ide, open Zed
+aetherion ide                        # re-enter (opens `zed .`)
+aetherion ide bash                   # drop to a shell instead
+```
+
+Different shape from [`vscode-ide`](#vscode-ide) / [`cursor-ide`](#cursor-ide):
+those are Electron (Chromium) apps with a fat libgtk/libnss/libgbm runtime and
+a `--use-gl=angle` wrapper trick for the no-GPU case. Zed is a native Rust app
+that paints via Vulkan, so the dep set is different and the no-GPU fallback is
+Mesa's `lavapipe` software ICD (shipped in `mesa-vulkan-drivers`) with
+`ZED_ALLOW_EMULATED_GPU=1` exported by the wrapper when `/dev/dri` is absent.
+
+- Zed from the official `cloud.zed.dev` tarball (native per-arch, extracted to
+  `/opt/zed.app/`). Channel + version pinnable via `ZED_CHANNEL` and
+  `ZED_VERSION` build args.
+- Vulkan loader + Mesa ICDs (hardware on Linux with `/dev/dri`, lavapipe
+  software fallback on macOS/XQuartz).
+- X11 client libs, fonts, Firefox-ESR for in-namespace OAuth.
+
+**Default Zed settings** (skeleton at `~/.config/zed/settings.json`):
+
+- Sign-in button hidden, telemetry (diagnostics + metrics) off, auto-update
+  disabled (rebuild the image to refresh Zed).
+- **Three-column layout**: file tree pinned to the left (`project_panel.dock:
+  "left"` — Zed defaults to right), agent / threads / chat panel pinned to the
+  right (`agent.dock: "right"` and `agent.sidebar_side: "right"` so the inner
+  thread list hugs the window edge). Git and outline panels also dock right
+  for a consistent "files left, everything else right" split.
+
+Auto-opening the agent panel on first launch isn't settings-controllable yet
+(only `project_panel` has a `starts_open` key — see Zed issue [#51542](https://github.com/zed-industries/zed/issues/51542));
+open it once with `ctrl-?` and Zed's default `restore_on_startup: "last_session"`
+keeps it open on subsequent launches into the same namespace.
+
+Everything else is Zed's vanilla defaults. Flip any of them back per-namespace
+if you want.
+
+**Agent CLIs (ACP)**: Zed's Agent Panel can talk to Claude Code, Gemini,
+Codex, Copilot, and other ACP agents. None of those CLIs are pre-installed
+here — Zed's first-use download path lands them in `~/.local/share/zed/` in
+the namespace, which persists across launches. If you want them on PATH
+system-wide instead (and `conduit` to wire them at a local model), use a
+separate [`cli-agents`](#cli-agents) namespace, or fork zed-ide to layer the
+agent installs in.
+
+`template.yaml` sets `display: x11` and `command: zed .`.
+
+**Use it when** you want Zed with namespace isolation. Same Linux/macOS
+support and the same XQuartz path on macOS as the Electron IDEs — though
+Vulkan-over-XQuartz via lavapipe is slower than ANGLE/SwiftShader for the
+Electron apps, so on macOS the Electron templates currently feel snappier.
 
 ---
 

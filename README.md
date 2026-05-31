@@ -21,6 +21,7 @@ for what you use:
 - **`cli-agents`** — `default` + every vendor agent CLI (Claude Code, Codex,
   Copilot, Gemini, Pi, Cursor Agent, OpenClaw, Hermes) + the `conduit` bridge.
 - **`vscode-ide`** / **`cursor-ide`** — GUI IDEs (Electron) with X11 forwarding.
+- **`zed-ide`** — Zed (native Rust GPU editor) with X11 forwarding; ACP-ready.
 
 A second CLI, **`conduit`** (shipped in the `cli-agents` template), points the
 agents at a model server running on your host (Ollama, LM Studio, or any
@@ -74,7 +75,7 @@ conduit launch pi               # pick a model in the TUI; pi launches against i
 ```
 
 See the [quick start guide](docs/quickstart.md) for the editor (`nvim`) and GUI
-IDE (`cursor-ide` / `vscode-ide`) paths.
+IDE (`cursor-ide` / `vscode-ide` / `zed-ide`) paths.
 
 ## Using a local model server
 
@@ -138,6 +139,12 @@ image version automatically. Per-user state — agent logins, npm globals, runti
 - **`vscode-ide`** / **`cursor-ide`** ship the IDE (Electron), X11 client libs,
   and Firefox-ESR for in-namespace OAuth — a lighter image without the agents or
   LSP servers.
+- **`zed-ide`** ships Zed (native Rust, Vulkan), Mesa lavapipe for the no-GPU
+  fallback path, X11 client libs, and Firefox-ESR for in-namespace OAuth.
+  Defaults: telemetry off, sign-in button hidden, auto-update disabled (the
+  install is image-managed); panels arranged as `files | editor | chat` with
+  the project tree pinned left and the agent / git / outline panels pinned
+  right.
 
 See [docs/templates.md](docs/templates.md) for the complete breakdown.
 
@@ -202,12 +209,12 @@ A template is a `Dockerfile` + `skeleton/` + `aetherion-src/` bundle that
 participate, user winning on name collisions:
 
 - **Baked-in** ship inside the package at `src/aetherion/data/templates/<name>/`.
-  Out of the box: `base`, `default`, `nvim`, `cli-agents`, `vscode-ide`, and
-  `cursor-ide`. Each is documented in full — with what it ships and its
-  quick-start commands — in [docs/templates.md](docs/templates.md). They're
-  carved up by responsibility (toolchains / editor / agents / GUI), and the
-  tiers are peers rather than a single stack, so a namespace only carries what
-  it needs.
+  Out of the box: `base`, `default`, `nvim`, `cli-agents`, `vscode-ide`,
+  `cursor-ide`, and `zed-ide`. Each is documented in full — with what it ships
+  and its quick-start commands — in [docs/templates.md](docs/templates.md).
+  They're carved up by responsibility (toolchains / editor / agents / GUI),
+  and the tiers are peers rather than a single stack, so a namespace only
+  carries what it needs.
 - **User-defined** live at `~/.aetherion/templates/<name>/`. Same shape; you
   write whatever Dockerfile you want. See
   [docs/custom-templates.md](docs/custom-templates.md).

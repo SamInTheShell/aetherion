@@ -80,15 +80,17 @@ aetherion edit bash                # drop to a shell instead
 `nvim` is also the recommended editor when you build your own templates — see
 [custom templates](custom-templates.md).
 
-## 2c. Run a GUI IDE (cursor-ide / vscode-ide)
+## 2c. Run a GUI IDE (cursor-ide / vscode-ide / zed-ide)
 
 ```shell
-aetherion ide --create cursor-ide  # or vscode-ide
+aetherion ide --create cursor-ide  # or vscode-ide, or zed-ide
 ```
 
 These forward an X11 GUI to your host display and open the IDE on your mounted
-project directory (`cursor .` / `code .`). They bundle Firefox so sign-in/OAuth
-completes entirely inside the namespace.
+project directory (`cursor .` / `code .` / `zed .`). The Electron IDEs
+(`cursor-ide`, `vscode-ide`) bundle Firefox so sign-in/OAuth completes entirely
+inside the namespace. `zed-ide` ships with telemetry off, the sign-in button
+hidden, and a `files | editor | chat` three-column panel layout out of the box.
 
 ### GUI templates on macOS
 

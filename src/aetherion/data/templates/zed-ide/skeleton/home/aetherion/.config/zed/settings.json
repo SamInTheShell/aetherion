@@ -1,0 +1,76 @@
+// Default Zed settings for aetherion zed-ide namespaces.
+//
+// This file is a *seed* (skeleton dotfile per STYLE.md): copied into
+// the namespace's $HOME on first launch and frozen there. Edits the
+// user makes inside the namespace win; rebuilding the image does NOT
+// refresh this file (use `aetherion reset namespace <name>` if you
+// want to drop user changes and reseed).
+//
+// Zed reads ~/.config/zed/settings.json on Linux (XDG). Project-level
+// overrides at <project>/.zed/settings.json still apply on top.
+//
+// Intentional defaults below — everything else is left at Zed's
+// upstream defaults so the editor feels like vanilla Zed:
+//
+//   - title_bar.show_sign_in: false
+//       Hides the top-right "Sign in" button. The container has no
+//       persistent Zed-account session anyway and the button just
+//       distracts. Users who want Zed AI / collab features can flip
+//       this back to `true` per-namespace.
+//
+//   - telemetry.diagnostics: false
+//   - telemetry.metrics: false
+//       Aetherion namespaces are ephemeral build sandboxes — crash
+//       reports and usage pings from inside one don't represent real
+//       user environments and would just be noise to Zed Industries.
+//       Opt back in per-namespace if you want to send them.
+//
+//   - auto_update: false
+//       Image-managed install at /opt/zed.app. In-namespace updates
+//       would land in $HOME and be lost on `aetherion rebuild
+//       namespace`. To refresh, rebuild the image with a newer
+//       ZED_VERSION build arg.
+//
+//   - project_panel.dock: "left"
+//       File tree on the left (Zed defaults to "right"). Sole left
+//       dweller, so it doesn't fight anything for the slot.
+//
+//   - agent.dock: "right"
+//   - agent.sidebar_side: "right"
+//       Agent / threads / chat panel on the right (Zed defaults to
+//       "left"). With project_panel on the left, this gives a
+//       three-column layout: files | editor | chat. The inner
+//       sidebar (thread/history list) also pins right so the chat
+//       textarea hugs the editor and the thread list hugs the window
+//       edge.
+//
+//   - git_panel.dock: "right"
+//   - outline_panel.dock: "right"
+//       Everything that isn't the file tree groups onto the right
+//       dock — single mental model for "where do non-file panels
+//       live" and avoids the default left-dock pileup with the file
+//       tree.
+//
+// NOT settable today: auto-opening the agent panel on first launch.
+// Only project_panel has a `starts_open` key (see Zed issue #51542
+// — tracking parity for the other dock panels). Open it once with
+// `cmd-?` / `ctrl-?` and Zed's default `restore_on_startup:
+// "last_session"` will reopen it on subsequent launches into the
+// same namespace.
+{
+  "title_bar": {
+    "show_sign_in": false,
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+  },
+  "auto_update": false,
+  "project_panel": { "dock": "left" },
+  "agent": {
+    "dock": "right",
+    "sidebar_side": "right",
+  },
+  "git_panel": { "dock": "right" },
+  "outline_panel": { "dock": "right" },
+}
