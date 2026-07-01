@@ -200,8 +200,8 @@ def _cmd_list_models() -> int:
         return 1
     # Print to stdout (not stderr) so users can pipe to grep/sort/wc without
     # losing the data to stderr-only filters.
-    for name in sorted(models):
-        print(name)
+    for m in sorted(models, key=lambda m: m.id):
+        print(m.id)
     return 0
 
 
@@ -223,36 +223,47 @@ def _cmd_launch(name: str, model_override: str | None, extra_args: list[str]) ->
         sys.stderr.write(f"conduit: {e}\n")
         return 1
 
+    by_id = {m.id: m for m in models}
+
     if model_override is not None:
         # Validate against the endpoint's catalog so a typo doesn't silently
         # launch the agent against a model the server can't actually serve.
-        if model_override not in models:
+        if model_override not in by_id:
             sys.stderr.write(
                 f"conduit: model {model_override!r} is not available at "
                 f"{s.endpoint_alias or s.endpoint}.\n"
                 f"conduit: available models:\n"
             )
             for m in models:
-                sys.stderr.write(f"  - {m}\n")
+                sys.stderr.write(f"  - {m.id}\n")
             return 2
-        chosen = model_override
+        chosen_id = model_override
     else:
         last = s.last_models.get(name)
-        chosen = picker.pick(
+        chosen_id = picker.pick(
             f"Select a model for {name} (via {s.endpoint_alias or s.endpoint}):",
-            models,
+            [m.id for m in models],
             default=last,
         )
-        if chosen is None:
+        if chosen_id is None:
             sys.stderr.write("conduit: cancelled.\n")
             return 130
 
-    s.last_models[name] = chosen
+    s.last_models[name] = chosen_id
     settings_mod.save(s)
 
-    sys.stderr.write(f"conduit: launching {name} with {chosen}…\n")
+    # Fill in capability fields the catalog didn't surface (Ollama in
+    # particular hides context window behind /api/show). Best-effort:
+    # if enrichment fails, the integration falls back to its own default.
+    chosen_model = endpoint_mod.enrich_model(s.endpoint, by_id[chosen_id])
+
+    ctx = chosen_model.context_window
+    ctx_label = f"ctx={ctx}" if ctx is not None else "ctx=?"
+    sys.stderr.write(
+        f"conduit: launching {name} with {chosen_id} ({ctx_label})…\n"
+    )
     sys.stderr.flush()
-    return integration.launch(s.endpoint, chosen, extra_args)
+    return integration.launch(s.endpoint, chosen_model, extra_args)
 
 
 if __name__ == "__main__":

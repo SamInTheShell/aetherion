@@ -16,6 +16,7 @@ import signal
 import subprocess
 from pathlib import Path
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 from conduit.shim import ShimServer
 
@@ -37,10 +38,13 @@ _CONFIG_PATH = _CODEX_DIR / "config.toml"
 # `"function"`, so we ship a catalog that explicitly lists no experimental
 # tools — matching what `ollama launch codex` writes.
 _CATALOG_PATH = _CODEX_DIR / "model.json"
-# 128k matches codex's own fallback (codexFallbackContextWindow in
-# .idea/ollama/cmd/launch/codex.go) — high enough not to clip prompts on
-# any model we'd plausibly point at, low enough not to lie about a tiny
-# local model's real window.
+# Used only when the endpoint didn't surface a context window for the
+# chosen model AND post-pick enrichment (Ollama /api/show, etc.) couldn't
+# find one either. 128k matches codex's own fallback
+# (codexFallbackContextWindow in .idea/ollama/cmd/launch/codex.go) — high
+# enough not to clip prompts on any model we'd plausibly point at, low
+# enough not to lie about a tiny local model's real window when we have
+# zero information.
 _FALLBACK_CONTEXT_WINDOW = 128_000
 _PROFILE_NAME = "conduit"
 
@@ -49,7 +53,7 @@ _PROFILE_NAME = "conduit"
 _MANAGED_HEADERS = (f"[profiles.{_PROFILE_NAME}]", f"[model_providers.{_PROFILE_NAME}]")
 
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("codex", _INSTALL_HINT)
     if bin_path is None:
         return 127
@@ -66,7 +70,7 @@ def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
     shim.start()
     try:
         _write_model_catalog(model)
-        _write_config(shim.local_url, model)
+        _write_config(shim.local_url, model.id)
         # `--profile` activates the launcher-managed [profiles.conduit] block
         # without overwriting the user's default profile in ~/.codex/config.toml.
         return _run_codex(bin_path, extra_args)
@@ -201,7 +205,7 @@ def _render_block(model: str, base_url: str) -> str:
     )
 
 
-def _write_model_catalog(model: str) -> None:
+def _write_model_catalog(model: Model) -> None:
     """Write a single-entry model.json catalog at ~/.codex/model.json that
     advertises only the standard `function`-typed tool schema. Mirrors
     `codexAppCatalogEntry` in .idea/ollama/cmd/launch/codex_app.go — the
@@ -223,9 +227,10 @@ def _write_model_catalog(model: str) -> None:
     type isn't `"function"` with `tools.N.type: invalid_string`, so the
     catalog has to suppress all of them.
     """
+    context_window = model.context_window or _FALLBACK_CONTEXT_WINDOW
     entry: dict[str, object] = {
-        "slug": model,
-        "display_name": model,
+        "slug": model.id,
+        "display_name": model.id,
         "description": "conduit-routed local model",
         "default_reasoning_level": None,
         "supported_reasoning_levels": [],
@@ -247,8 +252,8 @@ def _write_model_catalog(model: str) -> None:
         "truncation_policy": {"mode": "bytes", "limit": 10_000},
         "supports_parallel_tool_calls": False,
         "supports_image_detail_original": False,
-        "context_window": _FALLBACK_CONTEXT_WINDOW,
-        "max_context_window": _FALLBACK_CONTEXT_WINDOW,
+        "context_window": context_window,
+        "max_context_window": context_window,
         "auto_compact_token_limit": None,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],

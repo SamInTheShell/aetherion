@@ -7,6 +7,7 @@ model overrides, then exec the binary. Mirrors what
 """
 from __future__ import annotations
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 
 NAME = "claude"
@@ -18,7 +19,7 @@ _INSTALL_HINT = (
 )
 
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("claude", _INSTALL_HINT)
     if bin_path is None:
         return 127
@@ -33,14 +34,14 @@ def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
         # Pin every model tier to the picked model so /switch in-app doesn't
         # silently flip back to a tier (Opus/Sonnet/Haiku) that the local
         # server doesn't serve.
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model.id,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": model.id,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model.id,
+        "CLAUDE_CODE_SUBAGENT_MODEL": model.id,
         # Strip the attribution header so we don't leak conduit-internal
         # routing back to Anthropic from a non-Anthropic backend.
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
     }
 
-    args = ["--model", model, *extra_args] if model else list(extra_args)
+    args = ["--model", model.id, *extra_args]
     _common.execv_with_env(bin_path, args, env_overrides)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 
 NAME = "openclaw"
@@ -25,11 +26,11 @@ _INSTALL_HINT = (
 _CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("openclaw", _INSTALL_HINT)
     if bin_path is None:
         return 127
-    _write_config(endpoint, model)
+    _write_config(endpoint, model.id)
     os.execv(bin_path, [bin_path, *extra_args])
 
 

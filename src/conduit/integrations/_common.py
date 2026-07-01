@@ -1,10 +1,14 @@
 """Shared helpers for ``conduit launch`` integrations.
 
 Every integration module exposes ``NAME`` (the CLI keyword), an optional
-``DISPLAY_NAME``, and ``launch(endpoint, model, extra_args) -> int``. The
-helpers here are the bits each integration tends to need: atomic JSON
-writes, binary discovery with a uniform missing-binary message, and
-``execv`` so the agent binary inherits stdio + signals cleanly.
+``DISPLAY_NAME``, and ``launch(endpoint, model, extra_args) -> int``,
+where ``model`` is an :class:`conduit.endpoint.Model` carrying the id
+plus best-effort capability hints (context window, max output tokens).
+The helpers here are the bits each integration tends to need: atomic
+JSON writes, binary discovery with a uniform missing-binary message,
+``execv`` so the agent binary inherits stdio + signals cleanly, and a
+shared derivation for "what max output tokens should we tell the agent
+to allow" when the endpoint doesn't surface a signal.
 """
 from __future__ import annotations
 
@@ -14,6 +18,8 @@ import shutil
 import sys
 from pathlib import Path
 from typing import NoReturn
+
+from conduit.endpoint import Model
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -66,3 +72,23 @@ def execv_with_env(bin_path: str, args: list[str], env_overrides: dict[str, str]
     """
     env = {**os.environ, **env_overrides}
     os.execvpe(bin_path, [bin_path, *args], env)
+
+
+def derive_max_output_tokens(model: Model) -> int | None:
+    """Best-effort max output tokens for a model. Endpoint signal wins
+    when present; otherwise we scale by the context window so a 260k
+    model gets meaningfully more headroom than an 8k one. Returns
+    ``None`` when we have no information at all and the integration
+    should fall back to its own default.
+
+    The ``context_window // 4`` heuristic balances two concerns: leave
+    enough room for the agent's prompt + tool-call history (which on
+    long-running sessions easily eats half the window), and cap at 32k
+    so we don't tell a model server to allocate response-side buffers
+    bigger than any realistic single completion will need.
+    """
+    if model.max_output_tokens is not None:
+        return model.max_output_tokens
+    if model.context_window is not None:
+        return min(model.context_window // 4, 32_768)
+    return None

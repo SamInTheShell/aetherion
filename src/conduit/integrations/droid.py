@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 
 NAME = "droid"
@@ -34,8 +35,14 @@ _CONFIG_PATH = Path.home() / ".factory" / "settings.json"
 # user-added providers.
 _API_KEY_MARKER = "conduit"
 
+# Floor for droid's maxOutputTokens. Used only when we couldn't derive a
+# value from the endpoint's reported context window. Matches the value
+# the previous hardcoded path wrote, which was high enough to cover the
+# big-PR / multi-tool-output completions droid tends to issue.
+_FALLBACK_MAX_OUTPUT_TOKENS = 64_000
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("droid", _INSTALL_HINT)
     if bin_path is None:
         return 127
@@ -43,7 +50,7 @@ def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
     os.execv(bin_path, [bin_path, *extra_args])
 
 
-def _write_config(endpoint: str, model: str) -> None:
+def _write_config(endpoint: str, model: Model) -> None:
     base_url = endpoint.rstrip("/") + "/v1"
     cfg = _common.load_json(_CONFIG_PATH)
 
@@ -61,14 +68,15 @@ def _write_config(endpoint: str, model: str) -> None:
 
     # Index 0 means our conduit row sits at the top of droid's model picker.
     # Existing user rows get bumped down by one.
-    model_id = f"conduit:{model}"
+    model_id = f"conduit:{model.id}"
+    max_output_tokens = _common.derive_max_output_tokens(model) or _FALLBACK_MAX_OUTPUT_TOKENS
     conduit_entry: dict[str, object] = {
-        "model": model,
-        "displayName": model,
+        "model": model.id,
+        "displayName": model.id,
         "baseUrl": base_url,
         "apiKey": _API_KEY_MARKER,
         "provider": "generic-chat-completion-api",
-        "maxOutputTokens": 64000,
+        "maxOutputTokens": max_output_tokens,
         "supportsImages": False,
         "id": model_id,
         "index": 0,

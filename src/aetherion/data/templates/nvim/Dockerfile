@@ -344,6 +344,7 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
 
 COPY skeleton/etc/containers/ /etc/containers/
 COPY --chmod=0644 skeleton/etc/profile.d/aetherion-bridge.sh /etc/profile.d/aetherion-bridge.sh
+COPY --chmod=0644 skeleton/etc/profile.d/aetherion-path.sh /etc/profile.d/aetherion-path.sh
 
 # ---------------------------------------------------------------------------
 # Stage 10: skeleton dotfiles (full nvim config tree + bashrc + starship)

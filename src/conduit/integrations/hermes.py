@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 
 NAME = "hermes"
@@ -37,15 +38,15 @@ _PROVIDER_DISPLAY_NAME = "Conduit"
 _PLACEHOLDER_KEY = "conduit"
 
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("hermes", _INSTALL_HINT)
     if bin_path is None:
         return 127
-    _write_config(endpoint, model)
+    _write_config(endpoint, model.id)
     os.execv(bin_path, [bin_path, *extra_args])
 
 
-def _write_config(endpoint: str, model: str) -> None:
+def _write_config(endpoint: str, model_id: str) -> None:
     base_url = endpoint.rstrip("/") + "/v1"
 
     cfg = _load_yaml(_CONFIG_PATH)
@@ -55,7 +56,7 @@ def _write_config(endpoint: str, model: str) -> None:
     if not isinstance(model_section, dict):
         model_section = {}
     model_section["provider"] = _PROVIDER_KEY
-    model_section["default"] = model
+    model_section["default"] = model_id
     model_section["base_url"] = base_url
     model_section["api_key"] = _PLACEHOLDER_KEY
     cfg["model"] = model_section
@@ -69,12 +70,12 @@ def _write_config(endpoint: str, model: str) -> None:
         entry = {}
     entry["name"] = _PROVIDER_DISPLAY_NAME
     entry["api"] = base_url
-    entry["default_model"] = model
+    entry["default_model"] = model_id
     # Single-model list since we only know about the picked model. Hermes is
     # happy with a one-element list and surfaces it as the only switchable
     # option for this provider — which matches the conduit UX (pick once,
     # configure, launch).
-    entry["models"] = [model]
+    entry["models"] = [model_id]
     providers[_PROVIDER_KEY] = entry
     cfg["providers"] = providers
 

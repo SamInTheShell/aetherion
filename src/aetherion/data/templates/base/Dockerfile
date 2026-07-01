@@ -86,6 +86,10 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
         --comment "Aetherion dev user" \
         ${USERNAME}
 
+# /etc/profile.d/aetherion-path.sh re-establishes PATH after /etc/profile
+# overwrites the image's ENV PATH (Debian default behavior on `bash -l`).
+COPY --chmod=0644 skeleton/etc/profile.d/aetherion-path.sh /etc/profile.d/aetherion-path.sh
+
 # Skeleton dotfiles (.bashrc + starship.toml) overlay /etc/skel's seeds.
 # Our .bashrc wins; .profile is left alone so the login-shell -> .bashrc
 # chain works as standard.

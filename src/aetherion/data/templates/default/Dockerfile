@@ -338,6 +338,11 @@ COPY skeleton/etc/containers/ /etc/containers/
 # convenience flags). Silently no-ops otherwise.
 COPY --chmod=0644 skeleton/etc/profile.d/aetherion-bridge.sh /etc/profile.d/aetherion-bridge.sh
 
+# Re-establish PATH after /etc/profile overwrites the image's ENV PATH
+# (Debian default behavior on `bash -l`). Without this, /opt/node/bin and
+# the user-local tool dirs ($HOME/.cargo/bin, etc.) get silently dropped.
+COPY --chmod=0644 skeleton/etc/profile.d/aetherion-path.sh /etc/profile.d/aetherion-path.sh
+
 # ---------------------------------------------------------------------------
 # Stage 7: skeleton dotfiles (root → /home/${USERNAME})
 # ---------------------------------------------------------------------------

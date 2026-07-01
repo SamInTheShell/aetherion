@@ -7,6 +7,7 @@ OpenAI-compatible ``/v1`` path and exec the binary. Mirrors what
 """
 from __future__ import annotations
 
+from conduit.endpoint import Model
 from conduit.integrations import _common
 
 NAME = "copilot"
@@ -19,7 +20,7 @@ _INSTALL_HINT = (
 )
 
 
-def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
+def launch(endpoint: str, model: Model, extra_args: list[str]) -> int:
     bin_path = _common.find_binary_or_fail("copilot", _INSTALL_HINT)
     if bin_path is None:
         return 127
@@ -30,8 +31,8 @@ def launch(endpoint: str, model: str, extra_args: list[str]) -> int:
         "COPILOT_PROVIDER_BASE_URL": endpoint.rstrip("/") + "/v1",
         "COPILOT_PROVIDER_API_KEY": "",
         "COPILOT_PROVIDER_WIRE_API": "responses",
-        "COPILOT_MODEL": model,
+        "COPILOT_MODEL": model.id,
     }
 
-    args = ["--model", model, *extra_args] if model else list(extra_args)
+    args = ["--model", model.id, *extra_args]
     _common.execv_with_env(bin_path, args, env_overrides)
